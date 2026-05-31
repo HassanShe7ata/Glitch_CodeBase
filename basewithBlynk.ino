@@ -546,6 +546,32 @@ BLYNK_WRITE(V25) {
     Blynk.virtualWrite(V23, Motor_speed);
 }
 
+// ===================== CAMERA SCAN COMMANDS =====================
+
+// V21 — Trigger QR scan (ask camera to detect QR codes)
+BLYNK_WRITE(V21) {
+    if (param.asInt()) {
+        sendScanRequest(0); // mode=0: QR scan
+        Serial.println("[SCAN] QR scan requested");
+    }
+}
+
+// V22 — Trigger platform scan (ask camera to detect square platform)
+BLYNK_WRITE(V22) {
+    if (param.asInt()) {
+        sendScanRequest(1); // mode=1: platform scan
+        Serial.println("[SCAN] Platform scan requested");
+    }
+}
+
+// V26 — Move arm to scan position (camera looks forward-down)
+BLYNK_WRITE(V26) {
+    if (param.asInt()) {
+        sendCommandToArm("S");
+        Serial.println("[SCAN] Arm moving to scan pose");
+    }
+}
+
 // ================================================================
 // SETUP
 // ================================================================
@@ -665,6 +691,27 @@ void loop() {
         forceStop();
         isMoving = false;
         Serial.println("[WATCHDOG] Auto-stop: move timeout");
+    }
+
+    // Push latest camera data to Blynk every 2 seconds
+    static unsigned long lastCamUpdate = 0;
+    if (cameraPoseReceived && millis() - lastCamUpdate > 2000) {
+        lastCamUpdate = millis();
+
+        // V11 = confidence (0-100 for gauge widget)
+        Blynk.virtualWrite(V11, (int)(lastPoseReply.confidence * 100));
+
+        // V12 = yaw angle (for strafing indicator)
+        Blynk.virtualWrite(V12, lastPoseReply.yaw_deg);
+
+        // V13 = detected color text
+        const char* colorNames[] = {"NONE", "RED", "GREEN", "BLUE"};
+        int ci = lastPoseReply.color;
+        if (ci > 3) ci = 0;
+        Blynk.virtualWrite(V13, colorNames[ci]);
+
+        // V14 = distance in mm
+        Blynk.virtualWrite(V14, lastPoseReply.tz_mm);
     }
 
     if (autonomousMode && flag == 1)

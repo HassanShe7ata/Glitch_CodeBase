@@ -12,6 +12,7 @@
 #include "img_converters.h"
 #include "quirc.h"
 #include "arm_pose_link.h"
+#include "platform_detect.h"
 #include <math.h>
 #include <freertos/semphr.h>
 
@@ -54,6 +55,10 @@ static bool g_espnow_ready = false;
 static volatile bool g_scan_requested = false;
 static volatile uint8_t g_scan_task_id = 0;
 static volatile uint8_t g_scan_mode = 0;
+
+// Latest platform detection result (for /platform HTTP endpoint)
+static PlatformResult g_last_platform = {};
+static uint32_t g_platform_detect_ms = 0;
 
 #define STREAM_FRAME_SIZE FRAMESIZE_VGA
 #define STREAM_JPEG_QUALITY 12
@@ -1005,6 +1010,42 @@ static void process_qr_frame() {
         }
     }
 
+    // Platform detection: run periodically and on scan_mode==1 request
+    static uint32_t s_platform_frame_counter = 0;
+    s_platform_frame_counter++;
+    bool run_platform = (g_scan_mode == 1) || (s_platform_frame_counter % 15 == 0);
+
+    if (run_platform && g_gray_buf) {
+        uint32_t pt0 = millis();
+        PlatformResult plat = detect_platform(g_gray_buf, g_frame_w, g_frame_h);
+        g_platform_detect_ms = millis() - pt0;
+        g_last_platform = plat;
+
+        if (plat.detected) {
+            Serial.printf("[PLATFORM] Detected: cx=%.0f cy=%.0f w=%.0f h=%.0f conf=%.2f dist=%.0fmm %ums\n",
+                          plat.center_x, plat.center_y, plat.width_px, plat.height_px,
+                          plat.confidence, plat.distance_mm, (unsigned)g_platform_detect_ms);
+
+            // Send platform position via ESP-NOW when explicitly requested
+            if (g_scan_mode == 1 && g_espnow_ready) {
+                PoseReply preply = {};
+                preply.task_id = g_scan_task_id;
+                preply.pose_valid = 1;
+                preply.color = 0xFF; // special: platform detection
+                preply.estimated = 0;
+                float cx_offset = plat.center_x - (g_frame_w / 2.0f);
+                float fov_px = g_K.fx;
+                preply.yaw_deg = atan2f(cx_offset, fov_px) * 180.0f / M_PI;
+                preply.tz_mm = plat.distance_mm;
+                preply.tx_mm = plat.center_x;
+                preply.ty_mm = plat.center_y;
+                preply.confidence = plat.confidence;
+                esp_now_send(baseMacAddress, (uint8_t *)&preply, sizeof(preply));
+            }
+        }
+        if (g_scan_mode == 1) g_scan_mode = 0;
+    }
+
     if (count > 0 || valid > 0 || g_track.active) {
         Serial.printf("[QR] grids=%d decoded=%d obs=%d p=%.2f tracked=%d conf=%.2f age=%ums proc=%ums\n",
                       count,
@@ -1232,8 +1273,28 @@ static esp_err_t status_handler(httpd_req_t *req) {
     return httpd_resp_sendstr(req, buf);
 }
 
+// /platform endpoint: latest platform detection result.
+static esp_err_t platform_handler(httpd_req_t *req) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"detected\":%s,\"center_x\":%.1f,\"center_y\":%.1f,\"width\":%.1f,\"height\":%.1f,\"angle\":%.1f,\"confidence\":%.3f,\"distance_mm\":%.1f,\"processing_ms\":%u}",
+        g_last_platform.detected ? "true" : "false",
+        g_last_platform.center_x,
+        g_last_platform.center_y,
+        g_last_platform.width_px,
+        g_last_platform.height_px,
+        g_last_platform.angle_deg,
+        g_last_platform.confidence,
+        g_last_platform.distance_mm,
+        (unsigned)g_platform_detect_ms);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_sendstr(req, buf);
+}
+
 // Start two HTTP servers:
-// - port 80 for JSON API + capture
+// - port 80 for JSON API + capture + platform
 // - port 81 for MJPEG stream
 static void startServer() {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -1246,11 +1307,12 @@ static void startServer() {
         {"/capture", HTTP_GET, capture_handler, NULL},
         {"/data", HTTP_GET, data_handler, NULL},
         {"/status", HTTP_GET, status_handler, NULL},
+        {"/platform", HTTP_GET, platform_handler, NULL},
     };
 
     if (httpd_start(&g_httpd, &cfg) == ESP_OK) {
         for (auto &u : api_uris) httpd_register_uri_handler(g_httpd, &u);
-        Serial.println("API server:    port 80  (/capture /data /status)");
+        Serial.println("API server:    port 80  (/capture /data /status /platform)");
     }
 
     httpd_config_t scfg = HTTPD_DEFAULT_CONFIG();
@@ -1424,6 +1486,13 @@ void setup() {
     g_K.cy = fh / 2.0f;
 
     if (g_camera_ok) init_qr(fw, fh);
+
+    // Initialize platform detector
+    if (g_camera_ok) {
+        if (!platform_detect_init(fw, fh)) {
+            Serial.println("[WARN] Platform detector init failed (non-critical)");
+        }
+    }
 
     startServer();
 
