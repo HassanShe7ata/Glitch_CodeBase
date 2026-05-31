@@ -37,6 +37,40 @@ struct_message armMessage;
 
 esp_now_peer_info_t peerInfo;
 
+// =================== CAMERA ESP-NOW ===================
+// Camera ESP32-S3 MAC Address — update when you read it from Serial Monitor
+// Camera prints "CAMERA MAC: xx:xx:xx:xx:xx:xx" on boot
+static uint8_t cameraAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // CHANGE THIS
+
+// ESP-NOW packet: Base → Camera (scan request)
+struct __attribute__((packed)) ScanRequest {
+    uint8_t task_id;
+    uint8_t mode;        // 0=scan_qr, 1=scan_platform
+    uint8_t reserved[2];
+};
+
+// ESP-NOW packet: Camera → Base (pose reply)
+struct __attribute__((packed)) PoseReply {
+    uint8_t task_id;
+    uint8_t pose_valid;
+    uint8_t color;       // 0=unknown, 1=R, 2=G, 3=B
+    uint8_t estimated;
+    float tx_mm;
+    float ty_mm;
+    float tz_mm;
+    float yaw_deg;
+    float confidence;
+};
+
+// Latest camera pose data (updated by ESP-NOW callback)
+static volatile bool cameraPoseReceived = false;
+static PoseReply lastPoseReply = {};
+
+// Movement watchdog
+static bool isMoving = false;
+static unsigned long lastMoveTime = 0;
+const unsigned long MOVE_TIMEOUT_MS = 3000; // auto-stop after 3 seconds
+
 // --- I2C Registers ---
 #define I2C_ADDR           0x34
 #define REG_MOTOR_TYPE     0x14
@@ -92,6 +126,25 @@ void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status)
         Serial.println("FAILED");
 }
 
+// ESP-NOW receive callback — handles pose replies from camera
+void OnDataRecv(const esp_now_recv_info_t *recvInfo,
+                const uint8_t *data, int len) {
+
+    // Check if it's a PoseReply from camera
+    if (len == sizeof(PoseReply)) {
+        memcpy((void *)&lastPoseReply, data, sizeof(PoseReply));
+        cameraPoseReceived = true;
+
+        Serial.printf("[CAM] Pose: valid=%d color=%d conf=%.2f yaw=%.1f tz=%.1f est=%d\n",
+                      lastPoseReply.pose_valid,
+                      lastPoseReply.color,
+                      lastPoseReply.confidence,
+                      lastPoseReply.yaw_deg,
+                      lastPoseReply.tz_mm,
+                      lastPoseReply.estimated);
+    }
+}
+
 void sendCommandToArm(const char* cmd) {
 
     strcpy(armMessage.command, cmd);
@@ -107,6 +160,21 @@ void sendCommandToArm(const char* cmd) {
         Serial.println("Command Sent");
     else
         Serial.println("Error Sending Command");
+}
+
+void sendScanRequest(uint8_t mode) {
+    ScanRequest req = {};
+    static uint8_t taskCounter = 0;
+    req.task_id = ++taskCounter;
+    req.mode = mode;
+
+    esp_err_t result = esp_now_send(cameraAddress,
+                                    (uint8_t *)&req,
+                                    sizeof(req));
+
+    Serial.printf("[CAM] Scan request sent: task=%d mode=%d (%s)\n",
+                  req.task_id, req.mode,
+                  result == ESP_OK ? "OK" : "FAILED");
 }
 
 // ================================================================
@@ -254,72 +322,155 @@ void rotateDegrees(bool clockwise, float degrees, int8_t maxSpeed) {
 
 BLYNK_WRITE(V0) {
     if (!autonomousMode) {
-        if (param.asInt()) {manualMove(V_FORWARD, Motor_speed); Serial.println("Going forwrard!");}
-        else {forceStop(); Serial.println("stopping!");}
+        if (param.asInt()) {
+            manualMove(V_FORWARD, Motor_speed);
+            isMoving = true;
+            lastMoveTime = millis();
+            Serial.println("Going forward!");
+        }
+        else {
+            forceStop();
+            isMoving = false;
+            Serial.println("stopping!");
+        }
     }
 }
 
 BLYNK_WRITE(V1) {
     if (!autonomousMode) {
-        if (param.asInt()) {manualMove(V_STRAFE_L, Motor_speed); Serial.println("Strafing left!");}
-        else {forceStop(); Serial.println("stopping!");}
+        if (param.asInt()) {
+            manualMove(V_STRAFE_L, Motor_speed);
+            isMoving = true;
+            lastMoveTime = millis();
+            Serial.println("Strafing left!");
+        }
+        else {
+            forceStop();
+            isMoving = false;
+            Serial.println("stopping!");
+        }
     }
 }
 
 BLYNK_WRITE(V2) {
     if (!autonomousMode) {
-        if (param.asInt()) {manualMove(V_BACKWARD, Motor_speed); Serial.println("Going backward!");}
-        else {forceStop(); Serial.println("stopping!");}
+        if (param.asInt()) {
+            manualMove(V_BACKWARD, Motor_speed);
+            isMoving = true;
+            lastMoveTime = millis();
+            Serial.println("Going backward!");
+        }
+        else {
+            forceStop();
+            isMoving = false;
+            Serial.println("stopping!");
+        }
     }
 }
 
 BLYNK_WRITE(V3) {
     if (!autonomousMode) {
-        if (param.asInt()) {manualMove(V_STRAFE_R, Motor_speed); Serial.println("Strafing right!");}
-        else {forceStop(); Serial.println("stopping!");}
+        if (param.asInt()) {
+            manualMove(V_STRAFE_R, Motor_speed);
+            isMoving = true;
+            lastMoveTime = millis();
+            Serial.println("Strafing right!");
+        }
+        else {
+            forceStop();
+            isMoving = false;
+            Serial.println("stopping!");
+        }
     }
 }
 
 
 BLYNK_WRITE(V4) {
     if (!autonomousMode) {
-        if (param.asInt()) manualMove(V_DIAG_FR, Motor_speed);
-        else {forceStop(); Serial.println("stopping!");}
+        if (param.asInt()) {
+            manualMove(V_DIAG_FR, Motor_speed);
+            isMoving = true;
+            lastMoveTime = millis();
+        }
+        else {
+            forceStop();
+            isMoving = false;
+            Serial.println("stopping!");
+        }
     }
 }
 
 BLYNK_WRITE(V5) {
     if (!autonomousMode) {
-        if (param.asInt()) manualMove(V_DIAG_FL, Motor_speed);
-        else {forceStop(); Serial.println("stopping!");}
+        if (param.asInt()) {
+            manualMove(V_DIAG_FL, Motor_speed);
+            isMoving = true;
+            lastMoveTime = millis();
+        }
+        else {
+            forceStop();
+            isMoving = false;
+            Serial.println("stopping!");
+        }
     }
 }
 
 BLYNK_WRITE(V6) {
     if (!autonomousMode) {
-        if (param.asInt()) manualMove(V_DIAG_BL, Motor_speed);
-        else forceStop();
+        if (param.asInt()) {
+            manualMove(V_DIAG_BL, Motor_speed);
+            isMoving = true;
+            lastMoveTime = millis();
+        }
+        else {
+            forceStop();
+            isMoving = false;
+        }
     }
 }
 
 BLYNK_WRITE(V7) {
     if (!autonomousMode) {
-        if (param.asInt()) manualMove(V_DIAG_BR, Motor_speed);
-        else {forceStop(); Serial.println("stopping!");}
+        if (param.asInt()) {
+            manualMove(V_DIAG_BR, Motor_speed);
+            isMoving = true;
+            lastMoveTime = millis();
+        }
+        else {
+            forceStop();
+            isMoving = false;
+            Serial.println("stopping!");
+        }
     }
 }
 
 BLYNK_WRITE(V8) {
     if (!autonomousMode) {
-        if (param.asInt()) manualMove(V_ROTATE_CW, Motor_speed);
-        else {forceStop(); Serial.println("stopping!");}
+        if (param.asInt()) {
+            manualMove(V_ROTATE_CW, Motor_speed);
+            isMoving = true;
+            lastMoveTime = millis();
+        }
+        else {
+            forceStop();
+            isMoving = false;
+            Serial.println("stopping!");
+        }
     }
 }
 
 BLYNK_WRITE(V9) {
     if (!autonomousMode) {
-        if (param.asInt()) manualMove(V_ROTATE_CCW, Motor_speed);
-        else {forceStop(); Serial.println("stopping!");}Serial.println("stopping!");
+        if (param.asInt()) {
+            manualMove(V_ROTATE_CCW, Motor_speed);
+            isMoving = true;
+            lastMoveTime = millis();
+        }
+        else {
+            forceStop();
+            isMoving = false;
+            Serial.println("stopping!");
+        }
     }
 }
 
@@ -329,9 +480,10 @@ BLYNK_WRITE(V10) {
 
     autonomousMode = param.asInt();
 
-    bool flag = 1;
+    flag = 1;
 
     forceStop();
+    isMoving = false;
 
     if (autonomousMode)
         Serial.println("AUTONOMOUS MODE");
@@ -365,7 +517,7 @@ BLYNK_WRITE(V18) {
 BLYNK_WRITE(V19) {
     if (param.asInt()) {
       sendCommandToArm("H");
-     Serial.println("GTC");
+     Serial.println("H");
     }
 
 }
@@ -485,11 +637,35 @@ void setup() {
     }
 
     Serial.println("ESP-NOW READY");
+
+    // ================= CAMERA ESP-NOW PEER =================
+    esp_now_register_recv_cb(OnDataRecv);
+
+    esp_now_peer_info_t camPeer = {};
+    memcpy(camPeer.peer_addr, cameraAddress, 6);
+    camPeer.channel = WiFi.channel();
+    camPeer.encrypt = false;
+    camPeer.ifidx = WIFI_IF_STA;
+
+    if (esp_now_add_peer(&camPeer) != ESP_OK) {
+        Serial.println("Failed to Add Camera Peer");
+    } else {
+        Serial.println("Camera ESP-NOW Peer Added");
+    }
 }
 
 void loop() {
 
     Blynk.run();
+
+    // =================== MOVEMENT WATCHDOG ===================
+    // Safety net: auto-stop if movement active for longer than timeout
+    // Catches missed Blynk button release events
+    if (isMoving && (millis() - lastMoveTime > MOVE_TIMEOUT_MS)) {
+        forceStop();
+        isMoving = false;
+        Serial.println("[WATCHDOG] Auto-stop: move timeout");
+    }
 
     if (autonomousMode && flag == 1)
     {
@@ -505,13 +681,12 @@ void loop() {
 
             moveDistanceKp(V_DIAG_BL, Motor_speed, 0.70, TICKS_DIAG);
             sendCommandToArm("BTF");
-            delay(9000); //can i use millis() here instead of delay to check for mode change more responsively?
+            delay(9000);
 
-            flag = 0; //to prevent repeating the autonomous sequence until the mode is toggled again
+            flag = 0;
 
             break;
         }
-        //when finished or when no more autonomous mode, return default states
         delay(200);
         sendCommandToArm("H");
         forceStop();

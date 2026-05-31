@@ -1,11 +1,13 @@
 /*
  * ESP32-S3 Vision - On-device QR + Pose Estimation
- * PC is used only for visualization/debugging.
+ * Communicates with base ESP32 via ESP-NOW.
+ * Serves MJPEG stream and JSON API for dashboard.
  */
 
 #include <Arduino.h>
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <esp_now.h>
 #include "esp_http_server.h"
 #include "img_converters.h"
 #include "quirc.h"
@@ -13,20 +15,45 @@
 #include <math.h>
 #include <freertos/semphr.h>
 
-// Network mode switch:
-// - false: connect to existing WiFi (STA mode)
-// - true: create local AP for direct laptop connection
-#define USE_AP_MODE true
+// =================== NETWORK CONFIG ===================
+// Connect to the shared laptop hotspot so dashboard browser
+// and ESP-NOW can both work simultaneously.
+#define USE_AP_MODE false
 
 static const char *ap_ssid = "ESP32S3-CAM";
 static const char *ap_password = "12345678";
-static const char *sta_ssid = "modahamouza";
-static const char *sta_password = "123study321";
+static const char *sta_ssid = "hassan's-laptop-hotspot";
+static const char *sta_password = "12345678";
 
-// Arm controller endpoint for QR pose packets over UDP.
-// For AP mode, assign the arm ESP a fixed IP in 192.168.4.x and update this.
-static const IPAddress arm_esp_ip(192, 168, 4, 2);
-static const uint16_t arm_esp_udp_port = 4210;
+// =================== ESP-NOW CONFIG ===================
+// Base ESP32 MAC Address — update this to match your base
+// Find it in Serial Monitor when base boots (prints "BASE MAC: xx:xx:xx:xx:xx:xx")
+static uint8_t baseMacAddress[] = {0x80, 0xF3, 0xDA, 0x42, 0x3E, 0x5C};
+
+// ESP-NOW packet: Base → Camera (scan request)
+struct __attribute__((packed)) ScanRequest {
+    uint8_t task_id;
+    uint8_t mode;        // 0=scan_qr, 1=scan_platform
+    uint8_t reserved[2];
+};
+
+// ESP-NOW packet: Camera → Base (pose reply)
+struct __attribute__((packed)) PoseReply {
+    uint8_t task_id;
+    uint8_t pose_valid;
+    uint8_t color;       // ArmColorCode enum
+    uint8_t estimated;
+    float tx_mm;
+    float ty_mm;
+    float tz_mm;
+    float yaw_deg;
+    float confidence;
+};
+
+static bool g_espnow_ready = false;
+static volatile bool g_scan_requested = false;
+static volatile uint8_t g_scan_task_id = 0;
+static volatile uint8_t g_scan_mode = 0;
 
 #define STREAM_FRAME_SIZE FRAMESIZE_VGA
 #define STREAM_JPEG_QUALITY 12
@@ -936,8 +963,7 @@ static void process_qr_frame() {
         track_predict_only(now_ms);
     }
 
-    // Send the most stable pose estimate to the arm ESP each processed frame.
-    ArmPosePacket arm_packet = {};
+    // Send pose to base via ESP-NOW when a scan was requested or periodically.
     const QRDetection *pose_src = NULL;
     if (g_track.active && g_track.det.pose_valid) {
         pose_src = &g_track.det;
@@ -945,20 +971,39 @@ static void process_qr_frame() {
         pose_src = &dets[best_idx];
     }
 
-    if (pose_src) {
-        arm_packet.x_mm = pose_src->tx;
-        arm_packet.y_mm = pose_src->ty;
-        arm_packet.z_mm = pose_src->tz;
-        arm_packet.roll_deg = pose_src->roll;
-        arm_packet.pitch_deg = pose_src->pitch;
-        arm_packet.yaw_deg = pose_src->yaw;
-        arm_packet.color = (uint8_t)arm_pose_color_from_text(pose_src->text, pose_src->text_len);
-        arm_packet.pose_valid = 1;
-    } else {
-        arm_packet.color = (uint8_t)ARM_COLOR_UNKNOWN;
-        arm_packet.pose_valid = 0;
+    // Send ESP-NOW pose reply when scan was requested or on every Nth frame
+    static uint32_t s_espnow_frame_counter = 0;
+    s_espnow_frame_counter++;
+    bool should_send = g_scan_requested || (s_espnow_frame_counter % 10 == 0);
+
+    if (should_send && g_espnow_ready) {
+        PoseReply reply = {};
+        reply.task_id = g_scan_task_id;
+
+        if (pose_src) {
+            reply.pose_valid = 1;
+            reply.tx_mm = pose_src->tx;
+            reply.ty_mm = pose_src->ty;
+            reply.tz_mm = pose_src->tz;
+            reply.yaw_deg = pose_src->yaw;
+            reply.color = (uint8_t)arm_pose_color_from_text(pose_src->text, pose_src->text_len);
+            reply.estimated = pose_src->estimated ? 1 : 0;
+            reply.confidence = pose_src->confidence;
+        } else {
+            reply.pose_valid = 0;
+            reply.color = (uint8_t)ARM_COLOR_UNKNOWN;
+            reply.estimated = 0;
+            reply.confidence = 0.0f;
+        }
+
+        esp_now_send(baseMacAddress, (uint8_t *)&reply, sizeof(reply));
+
+        if (g_scan_requested) {
+            g_scan_requested = false;
+            Serial.printf("[ESPNOW] Sent pose reply for task %d: valid=%d color=%d conf=%.2f yaw=%.1f\n",
+                          reply.task_id, reply.pose_valid, reply.color, reply.confidence, reply.yaw_deg);
+        }
     }
-    arm_pose_link_send(arm_packet);
 
     if (count > 0 || valid > 0 || g_track.active) {
         Serial.printf("[QR] grids=%d decoded=%d obs=%d p=%.2f tracked=%d conf=%.2f age=%ums proc=%ums\n",
@@ -1271,7 +1316,27 @@ static bool initCamera() {
     return true;
 }
 
-// Initialize network in STA or AP mode according to USE_AP_MODE.
+// ESP-NOW callback: receive scan requests from base
+static void onEspNowRecv(const esp_now_recv_info_t *recvInfo,
+                         const uint8_t *data, int len) {
+    if (len == sizeof(ScanRequest)) {
+        ScanRequest req;
+        memcpy(&req, data, sizeof(req));
+        g_scan_task_id = req.task_id;
+        g_scan_mode = req.mode;
+        g_scan_requested = true;
+        Serial.printf("[ESPNOW] Scan request: task=%d mode=%d\n", req.task_id, req.mode);
+    }
+}
+
+static void onEspNowSend(const uint8_t *mac, esp_now_send_status_t status) {
+    // Optional: log send failures for debugging
+    if (status != ESP_NOW_SEND_SUCCESS) {
+        Serial.println("[ESPNOW] Send failed");
+    }
+}
+
+// Initialize network and ESP-NOW
 static void initWiFi() {
     if (USE_AP_MODE) {
         WiFi.mode(WIFI_AP);
@@ -1296,16 +1361,38 @@ static void initWiFi() {
             Serial.printf("AP fallback - SSID: %s IP: %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
         }
     }
+
+    Serial.print("CAMERA MAC: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("CAMERA CHANNEL: ");
+    Serial.println(WiFi.channel());
+}
+
+static void initEspNow() {
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[ESPNOW] Init FAILED");
+        return;
+    }
+
+    esp_now_register_recv_cb(onEspNowRecv);
+    esp_now_register_send_cb(onEspNowSend);
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, baseMacAddress, 6);
+    peerInfo.channel = WiFi.channel();
+    peerInfo.encrypt = false;
+    peerInfo.ifidx = WIFI_IF_STA;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("[ESPNOW] Failed to add base peer");
+        return;
+    }
+
+    g_espnow_ready = true;
+    Serial.println("[ESPNOW] Ready — base peer added");
 }
 
 void setup() {
-    // Boot sequence:
-    // 1) serial and basic IO
-    // 2) synchronization primitives
-    // 3) network + camera
-    // 4) QR engine init
-    // 5) start API/stream servers
-    // 6) start dedicated QR processing task
     Serial.begin(115200);
     delay(1000);
 
@@ -1318,8 +1405,7 @@ void setup() {
     g_cam_mutex = xSemaphoreCreateMutex();
 
     initWiFi();
-    arm_pose_link_begin(arm_esp_ip, arm_esp_udp_port);
-    Serial.printf("Arm link target: %s:%u (UDP)\n", arm_esp_ip.toString().c_str(), (unsigned)arm_esp_udp_port);
+    initEspNow();
 
     g_camera_ok = false;
     for (int i = 0; i < 3; i++) {
@@ -1377,11 +1463,12 @@ void loop() {
 
     // Emit a low-rate heartbeat for field diagnostics (every 10 seconds).
     if (millis() - last > 10000) {
-        Serial.printf("[Health] heap=%lu psram=%lu wifi=%s cam=%s qr_fps=%.1f det=%d proc=%ums\n",
+        Serial.printf("[Health] heap=%lu psram=%lu wifi=%s cam=%s espnow=%s qr_fps=%.1f det=%d proc=%ums\n",
             (unsigned long)ESP.getFreeHeap(),
             (unsigned long)ESP.getFreePsram(),
             (WiFi.status() == WL_CONNECTED || USE_AP_MODE) ? "OK" : "DOWN",
             g_camera_ok ? "OK" : "FAIL",
+            g_espnow_ready ? "OK" : "DOWN",
             g_qr_fps,
             g_num_detections,
             (unsigned)g_processing_ms);

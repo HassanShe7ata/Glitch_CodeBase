@@ -242,6 +242,13 @@ void goHome() {
   moveRobot(0, 90, 150, -20, 0);
 }
 
+void scanPose() {
+
+  Serial.println("\n[SYSTEM] Moving to Scan Pose");
+
+  moveRobot(0, 150, 200, -45, 0);
+}
+
 // ================================================================
 // AUTOMATED FUNCTIONS
 // ================================================================
@@ -425,13 +432,19 @@ void OnDataRecv(const esp_now_recv_info_t *recvInfo,
 
    else if (cmd == "GTF"){
     GreenToFloor();
-    Serial.print("RTF");
+    Serial.print("GTF");
 
   }
 
   else if (cmd == "H"){
     goHome();
     Serial.print("H");
+
+  }
+
+  else if (cmd == "S"){
+    scanPose();
+    Serial.print("S");
 
   }
 
