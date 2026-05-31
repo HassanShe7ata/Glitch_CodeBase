@@ -177,6 +177,89 @@ void sendScanRequest(uint8_t mode) {
                   result == ESP_OK ? "OK" : "FAILED");
 }
 
+// Wait for a fresh camera PoseReply with timeout.
+// Clears stale flag, sends scan request, polls until data arrives or timeout.
+// Returns true if valid pose received.
+static bool waitForCameraPose(unsigned long timeout_ms) {
+    cameraPoseReceived = false;
+    sendScanRequest(0); // mode=0: QR scan
+
+    unsigned long t0 = millis();
+    while (!cameraPoseReceived && millis() - t0 < timeout_ms) {
+        Blynk.run();
+        delay(20);
+    }
+
+    if (!cameraPoseReceived) {
+        Serial.println("[AUTO] Camera scan timeout");
+        return false;
+    }
+    if (!lastPoseReply.pose_valid) {
+        Serial.println("[AUTO] Camera reported invalid pose");
+        return false;
+    }
+    return true;
+}
+
+// Camera-guided QR alignment for autonomous pickup.
+// Uses camera yaw_deg to strafe until centered, then approaches until
+// within APPROACH_DISTANCE_MM of the target, verifying confidence.
+// Returns true if alignment succeeded and pose is usable.
+static bool alignToQR() {
+    const float YAW_THRESHOLD_DEG = 6.0f;
+    const float APPROACH_DISTANCE_MM = 200.0f;
+    const float CONFIDENCE_THRESHOLD = 0.55f;
+    const int ALIGN_SPEED = 20;
+    const int MAX_ALIGN_STEPS = 12;
+    const int MAX_APPROACH_STEPS = 10;
+
+    // Step 1: Initial scan
+    if (!waitForCameraPose(5000)) return false;
+
+    Serial.printf("[AUTO] Detected: color=%d conf=%.2f yaw=%.1f dist=%.0fmm\n",
+                  lastPoseReply.color, lastPoseReply.confidence,
+                  lastPoseReply.yaw_deg, lastPoseReply.tz_mm);
+
+    // Step 2: Align yaw — strafe left/right until centered on QR
+    for (int step = 0; step < MAX_ALIGN_STEPS; step++) {
+        if (fabs(lastPoseReply.yaw_deg) <= YAW_THRESHOLD_DEG) break;
+
+        if (lastPoseReply.yaw_deg > 0)
+            manualMove(V_STRAFE_R, ALIGN_SPEED);
+        else
+            manualMove(V_STRAFE_L, ALIGN_SPEED);
+
+        delay(120);
+        forceStop();
+
+        if (!waitForCameraPose(3000)) return false;
+    }
+    forceStop();
+    Serial.printf("[AUTO] Yaw aligned: %.1f°\n", lastPoseReply.yaw_deg);
+
+    // Step 3: Approach — move forward until close enough
+    for (int step = 0; step < MAX_APPROACH_STEPS; step++) {
+        if (lastPoseReply.tz_mm <= APPROACH_DISTANCE_MM) break;
+
+        manualMove(V_FORWARD, ALIGN_SPEED);
+        delay(200);
+        forceStop();
+
+        if (!waitForCameraPose(3000)) return false;
+    }
+    forceStop();
+    Serial.printf("[AUTO] Approach complete: dist=%.0fmm conf=%.2f\n",
+                  lastPoseReply.tz_mm, lastPoseReply.confidence);
+
+    // Step 4: Verify confidence
+    if (lastPoseReply.confidence < CONFIDENCE_THRESHOLD) {
+        Serial.println("[AUTO] Low confidence, aborting pickup");
+        return false;
+    }
+
+    return true;
+}
+
 // ================================================================
 // HELPER FUNCTIONS
 // ================================================================
@@ -716,26 +799,44 @@ void loop() {
 
     if (autonomousMode && flag == 1)
     {
-        while (autonomousMode) {
+        Serial.println("[AUTO] Starting camera-guided autonomous pickup");
 
-            moveDistanceKp(V_STRAFE_R, Motor_speed, 1.0, TICKS_STRAFE);
-            sendCommandToArm("RTF");
-            delay(9000);
+        // Targets in order: RED, GREEN, BLUE
+        struct {
+            uint8_t colorCode;
+            const char *armCmd;
+            const char *label;
+        } const targets[] = {
+            {ARM_COLOR_R, "RTF", "RED"},
+            {ARM_COLOR_G, "GTF", "GREEN"},
+            {ARM_COLOR_B, "BTF", "BLUE"},
+        };
 
-            moveDistanceKp(V_FORWARD, Motor_speed, 1.0, TICKS_FWD_BWD);
-            sendCommandToArm("GTF");
-            delay(9000);
+        for (int i = 0; i < 3; i++) {
+            Serial.printf("[AUTO] --- Target %d: %s ---\n", i + 1, targets[i].label);
 
-            moveDistanceKp(V_DIAG_BL, Motor_speed, 0.70, TICKS_DIAG);
-            sendCommandToArm("BTF");
-            delay(9000);
+            if (!alignToQR()) {
+                Serial.printf("[AUTO] Alignment failed for %s, skipping\n", targets[i].label);
+                continue;
+            }
 
-            flag = 0;
-
-            break;
+            // Check detected color matches expected target
+            if (lastPoseReply.color == targets[i].colorCode) {
+                Serial.printf("[AUTO] Color match: %s — sending arm command\n", targets[i].label);
+                sendCommandToArm(targets[i].armCmd);
+                delay(9000);
+            } else {
+                const char *colorNames[] = {"NONE", "RED", "GREEN", "BLUE"};
+                int ci = lastPoseReply.color;
+                if (ci > 3) ci = 0;
+                Serial.printf("[AUTO] Color mismatch: expected %s, camera sees %s — skipping\n",
+                              targets[i].label, colorNames[ci]);
+            }
         }
-        delay(200);
+
         sendCommandToArm("H");
         forceStop();
+        flag = 0;
+        Serial.println("[AUTO] Autonomous pickup complete");
     }
 }

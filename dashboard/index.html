@@ -992,6 +992,53 @@
                 </div>
             </div>
 
+            <!-- Platform Detection -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title"><span class="icon">⬛</span> Platform Detection</div>
+                    <span id="plat-badge" class="card-badge offline">NO DATA</span>
+                </div>
+                <div class="card-body">
+                    <div class="qr-info-grid">
+                        <div class="qr-field">
+                            <div class="qr-field-label">Detected</div>
+                            <div id="plat-detected" class="qr-field-value">—</div>
+                        </div>
+                        <div class="qr-field">
+                            <div class="qr-field-label">Distance</div>
+                            <div id="plat-dist" class="qr-field-value">— mm</div>
+                        </div>
+                        <div class="qr-field">
+                            <div class="qr-field-label">Center (X,Y)</div>
+                            <div id="plat-center" class="qr-field-value">—, —</div>
+                        </div>
+                        <div class="qr-field">
+                            <div class="qr-field-label">Size (W×H)</div>
+                            <div id="plat-size" class="qr-field-value">— × —</div>
+                        </div>
+                        <div class="qr-field">
+                            <div class="qr-field-label">Angle</div>
+                            <div id="plat-angle" class="qr-field-value">—°</div>
+                        </div>
+                        <div class="qr-field">
+                            <div class="qr-field-label">Process Time</div>
+                            <div id="plat-proc" class="qr-field-value">— ms</div>
+                        </div>
+                    </div>
+
+                    <!-- Platform Confidence Bar -->
+                    <div class="confidence-bar-wrap">
+                        <div class="confidence-bar-header">
+                            <span class="confidence-bar-label">Confidence</span>
+                            <span id="plat-conf-value" class="confidence-bar-value" style="color:var(--text-muted);">—</span>
+                        </div>
+                        <div class="confidence-bar-track">
+                            <div id="plat-conf-fill" class="confidence-bar-fill" style="width:0%;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Event Log -->
             <div class="card log-card">
                 <div class="card-header">
@@ -1019,6 +1066,7 @@
     let dataInterval = null;
     let statusInterval = null;
     let blynkInterval = null;
+    let platformInterval = null;
     let cameraConnected = false;
     let blynkConnected = false;
     let lastDataTime = 0;
@@ -1090,6 +1138,10 @@
         statusInterval = setInterval(fetchStatus, 5000);
         fetchStatus();
 
+        // Start polling /platform every 1s
+        platformInterval = setInterval(fetchPlatform, 1000);
+        fetchPlatform();
+
         // Start polling Blynk API every 3s (motor speed)
         if (blynkIP && blynkToken) {
             log('sys', `Connecting to Blynk at ${blynkIP}:${blynkPort}...`);
@@ -1103,6 +1155,7 @@
         if (dataInterval) { clearInterval(dataInterval); dataInterval = null; }
         if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
         if (blynkInterval) { clearInterval(blynkInterval); blynkInterval = null; }
+        if (platformInterval) { clearInterval(platformInterval); platformInterval = null; }
 
         document.getElementById('stream-img').src = '';
         document.getElementById('stream-overlay').classList.remove('hidden');
@@ -1149,49 +1202,113 @@
                 document.getElementById('qr-estimated').style.color = qr.estimated ? 'var(--status-warn)' : 'var(--status-ok)';
 
                 document.getElementById('qr-age').textContent = `${qr.age_ms} ms`;
+                
+                // Update confidence bar
+                const conf = qr.confidence * 100;
+                const confFill = document.getElementById('conf-fill');
+                confFill.style.width = `${Math.min(100, Math.max(0, conf))}%`;
+                document.getElementById('conf-value').textContent = `${conf.toFixed(1)}%`;
+                
+                confFill.className = 'confidence-bar-fill';
+                if (conf > 80) confFill.classList.add('high');
+                else if (conf > 40) confFill.classList.add('mid');
+                else confFill.classList.add('low');
 
-                // Confidence
-                const conf = qr.confidence;
-                const confPct = Math.round(conf * 100);
-                document.getElementById('conf-value').textContent = `${confPct}%`;
-                document.getElementById('conf-value').style.color = conf >= 0.7 ? 'var(--status-ok)' : conf >= 0.4 ? 'var(--status-warn)' : 'var(--status-error)';
-                const fill = document.getElementById('conf-fill');
-                fill.style.width = `${confPct}%`;
-                fill.className = 'confidence-bar-fill ' + (conf >= 0.7 ? 'high' : conf >= 0.4 ? 'mid' : 'low');
+                // Update pose
+                document.getElementById('pose-tx').textContent = qr.pose.tx.toFixed(1);
+                document.getElementById('pose-ty').textContent = qr.pose.ty.toFixed(1);
+                document.getElementById('pose-tz').textContent = qr.pose.tz.toFixed(1);
+                document.getElementById('pose-roll').textContent = qr.pose.roll.toFixed(1);
+                document.getElementById('pose-pitch').textContent = qr.pose.pitch.toFixed(1);
+                document.getElementById('pose-yaw').textContent = qr.pose.yaw.toFixed(1);
+                document.getElementById('pose-badge').textContent = 'VALID';
+                document.getElementById('pose-badge').className = 'card-badge live';
 
-                // Pose
-                if (qr.pose_valid) {
-                    setBadge('pose-badge', 'VALID', 'live');
-                    document.getElementById('pose-tx').textContent = qr.tx?.toFixed(1);
-                    document.getElementById('pose-ty').textContent = qr.ty?.toFixed(1);
-                    document.getElementById('pose-tz').textContent = qr.tz?.toFixed(1);
-                    document.getElementById('pose-roll').textContent = qr.roll?.toFixed(1);
-                    document.getElementById('pose-pitch').textContent = qr.pitch?.toFixed(1);
-                    document.getElementById('pose-yaw').textContent = qr.yaw?.toFixed(1);
+                // Update Yaw visual indicator
+                const yaw = qr.pose.yaw;
+                document.getElementById('yaw-value-text').textContent = `${yaw > 0 ? '+' : ''}${yaw.toFixed(1)}°`;
+                // Map -30°..30° to 0..100%
+                let markerPct = 50 + (yaw / 30.0) * 50;
+                markerPct = Math.max(5, Math.min(95, markerPct));
+                document.getElementById('yaw-marker').style.left = `${markerPct}%`;
 
-                    // Yaw indicator
-                    const yaw = qr.yaw || 0;
-                    const clampedYaw = Math.max(-45, Math.min(45, yaw));
-                    const pct = 50 + (clampedYaw / 45) * 45; // maps -45..+45 to 5%..95%
-                    document.getElementById('yaw-marker').style.left = `${pct}%`;
-                    document.getElementById('yaw-value-text').textContent = `${yaw.toFixed(1)}°`;
-                } else {
-                    setBadge('pose-badge', 'INVALID', 'stale');
-                }
             } else {
                 setBadge('qr-badge', 'NO QR', 'offline');
                 document.getElementById('qr-text').textContent = '—';
                 document.getElementById('qr-text').className = 'qr-field-value color-unknown';
-                document.getElementById('conf-value').textContent = '—';
+                document.getElementById('qr-decoded').textContent = '—';
+                document.getElementById('qr-decoded').style.color = '';
+                document.getElementById('qr-estimated').textContent = '—';
+                document.getElementById('qr-estimated').style.color = '';
+                document.getElementById('qr-age').textContent = '— ms';
+                
                 document.getElementById('conf-fill').style.width = '0%';
-                setBadge('pose-badge', 'NO POSE', 'offline');
+                document.getElementById('conf-value').textContent = '—';
+
+                document.getElementById('pose-tx').textContent = '—';
+                document.getElementById('pose-ty').textContent = '—';
+                document.getElementById('pose-tz').textContent = '—';
+                document.getElementById('pose-roll').textContent = '—';
+                document.getElementById('pose-pitch').textContent = '—';
+                document.getElementById('pose-yaw').textContent = '—';
+                document.getElementById('pose-badge').textContent = 'NO POSE';
+                document.getElementById('pose-badge').className = 'card-badge offline';
+                
+                document.getElementById('yaw-value-text').textContent = '—°';
+                document.getElementById('yaw-marker').style.left = '50%';
             }
-        } catch (e) {
-            if (Date.now() - lastDataTime > 6000) {
+
+        } catch (err) {
+            console.error('Data fetch error:', err);
+            // If we miss data for > 3s, mark offline
+            if (Date.now() - lastDataTime > 3000) {
                 cameraConnected = false;
                 updateConnectionBadge('badge-camera', false);
-                setBadge('qr-badge', 'NO DATA', 'offline');
+                setBadge('qr-badge', 'OFFLINE', 'offline');
+                setBadge('pose-badge', 'OFFLINE', 'offline');
             }
+        }
+    }
+
+    /* ═══════════════════════════════════════════
+       Platform /platform polling
+       ═══════════════════════════════════════════ */
+    async function fetchPlatform() {
+        if (!polling || !camIP) return;
+        try {
+            const resp = await fetch(`http://${camIP}/platform`, { signal: AbortSignal.timeout(2000) });
+            const p = await resp.json();
+
+            if (p.detected) {
+                setBadge('plat-badge', 'DETECTED', 'live');
+                document.getElementById('plat-detected').textContent = '✔ Yes';
+                document.getElementById('plat-detected').style.color = 'var(--status-ok)';
+            } else {
+                setBadge('plat-badge', 'NOT DETECTED', 'offline');
+                document.getElementById('plat-detected').textContent = '✘ No';
+                document.getElementById('plat-detected').style.color = 'var(--status-error)';
+            }
+
+            document.getElementById('plat-dist').textContent = p.detected ? `${p.distance_mm.toFixed(0)} mm` : '—';
+            document.getElementById('plat-center').textContent = p.detected ? `${p.center_x.toFixed(0)}, ${p.center_y.toFixed(0)}` : '—, —';
+            document.getElementById('plat-size').textContent = p.detected ? `${p.width.toFixed(0)} × ${p.height.toFixed(0)}` : '— × —';
+            document.getElementById('plat-angle').textContent = p.detected ? `${p.angle.toFixed(1)}°` : '—°';
+            document.getElementById('plat-proc').textContent = `${p.processing_ms} ms`;
+
+            // Confidence bar
+            const conf = p.confidence * 100;
+            const confFill = document.getElementById('plat-conf-fill');
+            confFill.style.width = p.detected ? `${Math.min(100, Math.max(0, conf))}%` : '0%';
+            document.getElementById('plat-conf-value').textContent = p.detected ? `${conf.toFixed(1)}%` : '—';
+            
+            confFill.className = 'confidence-bar-fill';
+            if (conf > 80) confFill.classList.add('high');
+            else if (conf > 40) confFill.classList.add('mid');
+            else confFill.classList.add('low');
+
+        } catch (err) {
+            console.error('Platform fetch error:', err);
+            setBadge('plat-badge', 'ERROR', 'offline');
         }
     }
 

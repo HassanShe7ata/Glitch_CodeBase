@@ -18,6 +18,7 @@ Real-time sensor data and camera feed dashboard for the Glitch mecanum robot.
 | QR Detection | Detected text, decode status, confidence, age |
 | Pose Estimation | Translation (X/Y/Z mm) and rotation (roll/pitch/yaw °) |
 | Yaw Indicator | Visual bar showing QR left/right offset for strafing |
+| Platform Detection | Square platform position, distance, size, angle, confidence |
 | System Health | Free heap, PSRAM, QR FPS, tracker status |
 | Motor Speed | Ring gauge reading motor speed from Blynk REST API |
 | Event Log | Timestamped log of all dashboard events |

@@ -11,7 +11,6 @@
 #include "esp_http_server.h"
 #include "img_converters.h"
 #include "quirc.h"
-#include "arm_pose_link.h"
 #include "platform_detect.h"
 #include <math.h>
 #include <freertos/semphr.h>
@@ -25,6 +24,43 @@ static const char *ap_ssid = "ESP32S3-CAM";
 static const char *ap_password = "12345678";
 static const char *sta_ssid = "hassan's-laptop-hotspot";
 static const char *sta_password = "12345678";
+
+// =================== QR COLOR PARSING ===================
+enum ArmColorCode : uint8_t {
+    ARM_COLOR_UNKNOWN = 0,
+    ARM_COLOR_R = 1,
+    ARM_COLOR_G = 2,
+    ARM_COLOR_B = 3,
+};
+
+static bool starts_with_ci(const char *text, int text_len, const char *prefix) {
+    int n = (int)strlen(prefix);
+    if (!text || text_len < n) return false;
+    for (int i = 0; i < n; i++) {
+        char a = text[i];
+        char b = prefix[i];
+        if (a >= 'a' && a <= 'z') a = (char)(a - 'a' + 'A');
+        if (b >= 'a' && b <= 'z') b = (char)(b - 'a' + 'A');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static ArmColorCode arm_pose_color_from_text(const char *text, int text_len) {
+    if (!text || text_len <= 0) return ARM_COLOR_UNKNOWN;
+    if (starts_with_ci(text, text_len, "R") || starts_with_ci(text, text_len, "RED")) return ARM_COLOR_R;
+    if (starts_with_ci(text, text_len, "G") || starts_with_ci(text, text_len, "GREEN")) return ARM_COLOR_G;
+    if (starts_with_ci(text, text_len, "B") || starts_with_ci(text, text_len, "BLUE")) return ARM_COLOR_B;
+
+    for (int i = 0; i < text_len; i++) {
+        char c = text[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        if (c == 'R') return ARM_COLOR_R;
+        if (c == 'G') return ARM_COLOR_G;
+        if (c == 'B') return ARM_COLOR_B;
+    }
+    return ARM_COLOR_UNKNOWN;
+}
 
 // =================== ESP-NOW CONFIG ===================
 // Base ESP32 MAC Address — update this to match your base
