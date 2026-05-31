@@ -1,0 +1,52 @@
+21:39:32.930 INFO - Using data dir '.\data'
+21:39:32.963 INFO - Region : local. Host : 192.168.1.2.
+21:39:33.372 INFO - Initializing gmail smtp mail transport. Username : example@gmail.com. SMTP host : smtp.gmail.com:587
+21:39:33.547 INFO - Reports : 0
+21:39:33.547 INFO - Didn't find custom user certificates.
+21:39:33.547 INFO - Didn't find Let's Encrypt certificates.
+21:39:33.547 WARN - You didn't specified 'server.host' or 'contact.email' properties in server.properties file. Automatic certificate generation is turned off. Please specify above properties for automatic certificates retrieval.
+21:39:33.547 WARN - ATTENTION. Server certificate paths (cert : 'D:\Spring2026\Glitch_Codes\blynk-server', key : 'D:\Spring2026\Glitch_Codes\blynk-server') not valid. Using embedded server certs and one way ssl. This is not secure. Please replace it with your own certs.
+21:39:33.922 ERROR- Error initializing ssl context. Reason : No provider succeeded to generate a self-signed certificate. See debug log for the root cause.
+22:16:17.960 INFO - Using data dir '.\data'
+22:16:17.988 INFO - Region : local. Host : 192.168.1.2.
+22:16:18.595 INFO - Initializing gmail smtp mail transport. Username : example@gmail.com. SMTP host : smtp.gmail.com:587
+22:16:18.787 INFO - Reports : 0
+22:16:18.787 INFO - Didn't find custom user certificates.
+22:16:18.788 INFO - Didn't find Let's Encrypt certificates.
+22:16:18.788 WARN - You didn't specified 'server.host' or 'contact.email' properties in server.properties file. Automatic certificate generation is turned off. Please specify above properties for automatic certificates retrieval.
+22:16:18.788 WARN - ATTENTION. Server certificate paths (cert : 'D:\Spring2026\Glitch_Codes\blynk-server', key : 'D:\Spring2026\Glitch_Codes\blynk-server') not valid. Using embedded server certs and one way ssl. This is not secure. Please replace it with your own certs.
+22:16:19.946 INFO - HTTP API and WebSockets server listening at 8080 port.
+22:16:19.948 INFO - HTTPS API, WebSockets and Admin page server listening at 9443 port.
+22:16:19.949 INFO - Mqtt hardware server listening at 8440 port.
+22:42:01.995 WARN - User '3boud307@gmail.com' not registered. /192.168.1.8:35612
+22:47:36.790 ERROR- Error invoking handler. Reason : null.
+22:52:41.800 INFO - Using data dir '.\data'
+22:52:42.100 INFO - Region : local. Host : 192.168.1.2.
+22:52:42.750 INFO - Initializing gmail smtp mail transport. Username : example@gmail.com. SMTP host : smtp.gmail.com:587
+22:52:42.800 INFO - Reports : 0
+22:52:42.800 INFO - Didn't find custom user certificates.
+22:52:42.800 INFO - Didn't find Let's Encrypt certificates.
+22:52:42.800 WARN - You didn't specified 'server.host' or 'contact.email' properties in server.properties file. Automatic certificate generation is turned off. Please specify above properties for automatic certificates retrieval.
+22:52:42.800 WARN - ATTENTION. Server certificate paths (cert : 'D:\Spring2026\Glitch_Codes\blynk-server', key : 'D:\Spring2026\Glitch_Codes\blynk-server') not valid. Using embedded server certs and one way ssl. This is not secure. Please replace it with your own certs.
+22:52:44.266 INFO - HTTP API and WebSockets server listening at 8080 port.
+22:52:44.266 INFO - HTTPS API, WebSockets and Admin page server listening at 9443 port.
+22:52:44.266 INFO - Mqtt hardware server listening at 8440 port.
+22:53:21.397 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+22:53:44.632 INFO - Creating new dashboard.
+22:53:45.695 ERROR- Error sending email auth token to user : glitchblitz@gmail.com. Error: 535-5.7.8 Username and Password not accepted. For more information, go to
+535 5.7.8  https://support.google.com/mail/?p=BadCredentials 5b1f17b1804b1-4909d696cfdsm58702685e9.4 - gsmtp
+
+22:54:55.207 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+22:55:53.970 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:02:24.037 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:07:48.075 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:12:12.198 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:18:31.010 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:22:32.394 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:24:13.483 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:25:36.197 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:26:24.417 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:27:08.193 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:50:09.718 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:52:02.352 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
+23:54:40.875 INFO - glitchblitz@gmail.com Blynk-app (android-22734) joined.
