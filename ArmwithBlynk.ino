@@ -48,7 +48,8 @@ float currentAngle[NUM_SERVOS] = {90, 170, 180, 100, GRIP_OPEN};
 float startAngles[NUM_SERVOS];
 float targetAngles[NUM_SERVOS];
 
-const long moveDuration = 1000;
+const float MS_PER_DEGREE = 10.0f;
+const long MIN_MOVE_DURATION = 300;
 
 #define SERVOMIN  125
 #define SERVOMAX  550
@@ -85,12 +86,19 @@ int angleToPulse(float angle) {
 // EXECUTE SYNCHRONIZED MOVE
 // ================================================================
 
-void executeSyncMove(long duration) {
+void executeSyncMove() {
 
   unsigned long startTime = millis();
 
-  for(int i = 0; i < 5; i++)
+  float maxDelta = 0;
+  for(int i = 0; i < 5; i++) {
     startAngles[i] = currentAngle[i];
+    float delta = fabs(targetAngles[i] - currentAngle[i]);
+    if (delta > maxDelta) maxDelta = delta;
+  }
+  
+  long duration = (long)(maxDelta * MS_PER_DEGREE);
+  if (duration < MIN_MOVE_DURATION) duration = MIN_MOVE_DURATION;
 
   while (true) {
 
@@ -150,18 +158,21 @@ JointAngles calculateIK(float x, float y, float z, float phi_deg) {
     (2 * R_up * L4);
 
   if (cos_q3 < -1.0 || cos_q3 > 1.0) {
-
     angles.reachable = false;
-
     return angles;
   }
 
   float q3 = acos(cos_q3);
 
+  float denom = R_up + L4 * cos(q3);
+  if (fabs(denom) < 0.1f) {
+    angles.reachable = false;
+    return angles;
+  }
+
   float q2 =
     atan2(Zw, Rw) +
-    atan2(L4 * sin(q3),
-    R_up + L4 * cos(q3));
+    atan2(L4 * sin(q3), denom);
 
   float d1 = atan2(L3, L2);
 
@@ -170,6 +181,14 @@ JointAngles calculateIK(float x, float y, float z, float phi_deg) {
   angles.t3 = round((q3 + d1) * (180.0 / PI));
 
   angles.t4 = round(90 - ((phi - q2 + q3) * 180.0 / PI));
+
+  if (angles.t1 < 0 || angles.t1 > 180 ||
+      angles.t2 < 10 || angles.t2 > 170 ||
+      angles.t3 < 10 || angles.t3 > 170 ||
+      angles.t4 < 50 || angles.t4 > 180) {
+    angles.reachable = false;
+    return angles;
+  }
 
   angles.t1 = constrain(angles.t1, 0, 180);
   angles.t2 = constrain(angles.t2, 10, 170);
@@ -212,7 +231,7 @@ void moveRobot(float x,
     Serial.printf("TARGETS -> T1:%d T2:%d T3:%d T4:%d G:%.0f\n",
                   ik.t1, ik.t2, ik.t3, ik.t4, targetAngles[4]);
 
-    executeSyncMove(moveDuration);
+    executeSyncMove();
 
     Serial.printf("REACHED -> T1:%.1f T2:%.1f T3:%.1f T4:%.1f G:%.1f\n",
                   currentAngle[0],
@@ -397,57 +416,43 @@ void OnDataRecv(const esp_now_recv_info_t *recvInfo,
          incomingData,
          sizeof(incomingMessage));
 
-  String cmd = String(incomingMessage.command);
+  const char* cmd = incomingMessage.command;
 
   Serial.println("\n==============================");
   Serial.print("ESP-NOW COMMAND RECEIVED: ");
   Serial.println(cmd);
   Serial.println("==============================");
 
-  if (cmd == "GTC")
+  if (strcmp(cmd, "GTC") == 0)
     GreenToCar();
-
-  else if (cmd == "BTC"){
+  else if (strcmp(cmd, "BTC") == 0) {
     BlueToCar();
-      Serial.print("BTC");
+    Serial.print("BTC");
   }
-
-  else if (cmd == "RTC"){
-
+  else if (strcmp(cmd, "RTC") == 0) {
     RedToCar();
     Serial.print("RTC");
-
   }
-  else if (cmd == "BTF"){
+  else if (strcmp(cmd, "BTF") == 0) {
     BlueToFloor();
     Serial.print("BTF");
-
   }
-
-  else if (cmd == "RTF"){
+  else if (strcmp(cmd, "RTF") == 0) {
     RedToFloor();
     Serial.print("RTF");
-
   }
-
-   else if (cmd == "GTF"){
+  else if (strcmp(cmd, "GTF") == 0) {
     GreenToFloor();
     Serial.print("GTF");
-
   }
-
-  else if (cmd == "H"){
+  else if (strcmp(cmd, "H") == 0) {
     goHome();
     Serial.print("H");
-
   }
-
-  else if (cmd == "S"){
+  else if (strcmp(cmd, "S") == 0) {
     scanPose();
     Serial.print("S");
-
   }
-
   else
     Serial.println("[ERROR] Unknown Command");
 }

@@ -40,7 +40,7 @@ struct PlatformResult {
 #define PLATFORM_ASPECT_MIN   0.65f   // min aspect ratio (1.0 = perfect square)
 #define PLATFORM_ASPECT_MAX   1.45f   // max aspect ratio
 #define PLATFORM_SOLIDITY_MIN 0.75f   // min filled-area ratio
-#define PLATFORM_EDGE_THRESHOLD 40    // Sobel edge magnitude threshold
+#define PLATFORM_EDGE_THRESHOLD 160   // Sobel edge magnitude threshold
 
 // Initialize platform detector (allocates working buffers in PSRAM)
 // Call once during setup, after camera init.

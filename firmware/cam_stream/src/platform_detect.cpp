@@ -140,7 +140,7 @@ static void pd_sobel_edges() {
 
             // Approximate magnitude: |gx| + |gy| (faster than sqrt)
             int mag = abs(gx) + abs(gy);
-            pd_edge[y * pd_w + x] = (mag > PLATFORM_EDGE_THRESHOLD * 4) ? 255 : 0;
+            pd_edge[y * pd_w + x] = (mag > PLATFORM_EDGE_THRESHOLD) ? 255 : 0;
         }
     }
 

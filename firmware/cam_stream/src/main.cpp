@@ -91,9 +91,11 @@ static bool g_espnow_ready = false;
 static volatile bool g_scan_requested = false;
 static volatile uint8_t g_scan_task_id = 0;
 static volatile uint8_t g_scan_mode = 0;
+static portMUX_TYPE g_scan_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // Latest platform detection result (for /platform HTTP endpoint)
 static PlatformResult g_last_platform = {};
+static SemaphoreHandle_t g_platform_mutex = NULL;
 static uint32_t g_platform_detect_ms = 0;
 
 #define STREAM_FRAME_SIZE FRAMESIZE_VGA
@@ -1015,11 +1017,26 @@ static void process_qr_frame() {
     // Send ESP-NOW pose reply when scan was requested or on every Nth frame
     static uint32_t s_espnow_frame_counter = 0;
     s_espnow_frame_counter++;
-    bool should_send = g_scan_requested || (s_espnow_frame_counter % 10 == 0);
+
+    bool local_scan_req = false;
+    uint8_t local_task_id = 0;
+    uint8_t local_scan_mode = 0;
+
+    portENTER_CRITICAL(&g_scan_mux);
+    if (g_scan_requested) {
+        local_scan_req = true;
+        local_task_id = g_scan_task_id;
+        local_scan_mode = g_scan_mode;
+        g_scan_requested = false;
+        g_scan_mode = 0;
+    }
+    portEXIT_CRITICAL(&g_scan_mux);
+
+    bool should_send = local_scan_req || (s_espnow_frame_counter % 10 == 0);
 
     if (should_send && g_espnow_ready) {
         PoseReply reply = {};
-        reply.task_id = g_scan_task_id;
+        reply.task_id = local_task_id;
 
         if (pose_src) {
             reply.pose_valid = 1;
@@ -1039,8 +1056,7 @@ static void process_qr_frame() {
 
         esp_now_send(baseMacAddress, (uint8_t *)&reply, sizeof(reply));
 
-        if (g_scan_requested) {
-            g_scan_requested = false;
+        if (local_scan_req) {
             Serial.printf("[ESPNOW] Sent pose reply for task %d: valid=%d color=%d conf=%.2f yaw=%.1f\n",
                           reply.task_id, reply.pose_valid, reply.color, reply.confidence, reply.yaw_deg);
         }
@@ -1049,13 +1065,16 @@ static void process_qr_frame() {
     // Platform detection: run periodically and on scan_mode==1 request
     static uint32_t s_platform_frame_counter = 0;
     s_platform_frame_counter++;
-    bool run_platform = (g_scan_mode == 1) || (s_platform_frame_counter % 15 == 0);
+    bool run_platform = (local_scan_mode == 1) || (s_platform_frame_counter % 15 == 0);
 
     if (run_platform && g_gray_buf) {
         uint32_t pt0 = millis();
         PlatformResult plat = detect_platform(g_gray_buf, g_frame_w, g_frame_h);
+        
+        xSemaphoreTake(g_platform_mutex, portMAX_DELAY);
         g_platform_detect_ms = millis() - pt0;
         g_last_platform = plat;
+        xSemaphoreGive(g_platform_mutex);
 
         if (plat.detected) {
             Serial.printf("[PLATFORM] Detected: cx=%.0f cy=%.0f w=%.0f h=%.0f conf=%.2f dist=%.0fmm %ums\n",
@@ -1063,9 +1082,9 @@ static void process_qr_frame() {
                           plat.confidence, plat.distance_mm, (unsigned)g_platform_detect_ms);
 
             // Send platform position via ESP-NOW when explicitly requested
-            if (g_scan_mode == 1 && g_espnow_ready) {
+            if (local_scan_mode == 1 && g_espnow_ready) {
                 PoseReply preply = {};
-                preply.task_id = g_scan_task_id;
+                preply.task_id = local_task_id;
                 preply.pose_valid = 1;
                 preply.color = 0xFF; // special: platform detection
                 preply.estimated = 0;
@@ -1079,7 +1098,6 @@ static void process_qr_frame() {
                 esp_now_send(baseMacAddress, (uint8_t *)&preply, sizeof(preply));
             }
         }
-        if (g_scan_mode == 1) g_scan_mode = 0;
     }
 
     if (count > 0 || valid > 0 || g_track.active) {
@@ -1157,26 +1175,24 @@ static esp_err_t data_handler(httpd_req_t *req) {
     memcpy(dets, g_detections, sizeof(QRDetection) * n);
     xSemaphoreGive(g_data_mutex);
 
-    char *buf = (char *)malloc(4096);
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-    int off = snprintf(buf, 4096,
+    char part[384];
+    int off = snprintf(part, sizeof(part),
         "{\"frame_id\":%u,\"processing_ms\":%u,\"qr_fps\":%.1f,\"raw_count\":%d,\"decoded_count\":%d,\"qr_codes\":[",
         (unsigned)fid, (unsigned)proc_ms, fps, raw_count, decoded_count);
+    httpd_resp_send_chunk(req, part, off);
 
     for (int i = 0; i < n; i++) {
-        if (i > 0) buf[off++] = ',';
         char esc[MAX_QR_TEXT_LEN * 2];
         json_escape(esc, sizeof(esc), dets[i].text, dets[i].text_len);
-        off += snprintf(buf + off, 4096 - off,
-            "{\"text\":\"%s\",\"decoded\":%s,\"corners\":[[%.0f,%.0f],[%.0f,%.0f],[%.0f,%.0f],[%.0f,%.0f]],"
+        off = snprintf(part, sizeof(part),
+            "%s{\"text\":\"%s\",\"decoded\":%s,\"corners\":[[%.0f,%.0f],[%.0f,%.0f],[%.0f,%.0f],[%.0f,%.0f]],"
             "\"estimated\":%s,\"confidence\":%.3f,\"age_ms\":%u,"
             "\"pose_valid\":%s,\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.1f,"
             "\"roll\":%.1f,\"pitch\":%.1f,\"yaw\":%.1f}",
-            esc,
+            (i > 0) ? "," : "", esc,
             dets[i].decoded ? "true" : "false",
             dets[i].corners[0][0], dets[i].corners[0][1],
             dets[i].corners[1][0], dets[i].corners[1][1],
@@ -1188,14 +1204,11 @@ static esp_err_t data_handler(httpd_req_t *req) {
             dets[i].pose_valid ? "true" : "false",
             dets[i].tx, dets[i].ty, dets[i].tz,
             dets[i].roll, dets[i].pitch, dets[i].yaw);
+        httpd_resp_send_chunk(req, part, off);
     }
-    off += snprintf(buf + off, 4096 - off, "]}");
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    esp_err_t res = httpd_resp_send(req, buf, off);
-    free(buf);
-    return res;
+    httpd_resp_send_chunk(req, "]}", 2);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
 }
 
 // /stream endpoint (port 81): MJPEG stream primarily for laptop-side visualization.
@@ -1287,22 +1300,37 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 // /status endpoint: lightweight health/telemetry summary.
 static esp_err_t status_handler(httpd_req_t *req) {
     char buf[320];
+
+    xSemaphoreTake(g_data_mutex, portMAX_DELAY);
+    uint32_t proc_ms = g_processing_ms;
+    float fps = g_qr_fps;
+    int raw = g_qr_raw_count;
+    int dec = g_qr_decoded_count;
+    int dets = g_num_detections;
+    int err = g_last_decode_err;
+    int err_f = g_last_decode_err_flip;
+    uint32_t fid = g_frame_id;
+    bool track_act = g_track.active;
+    float track_cf = g_track.confidence;
+    uint32_t track_age = g_track.active ? g_track.det.age_ms : 0U;
+    xSemaphoreGive(g_data_mutex);
+
     snprintf(buf, sizeof(buf),
         "{\"camera\":\"%s\",\"free_heap\":%lu,\"psram_free\":%lu,\"qr_processing_ms\":%u,\"qr_fps\":%.1f,\"qr_raw\":%d,\"qr_decoded\":%d,\"qr_detections\":%d,\"decode_err\":%d,\"decode_err_flip\":%d,\"track_active\":%s,\"track_conf\":%.3f,\"track_age_ms\":%u,\"frame_id\":%u}",
         g_camera_ok ? "OK" : "FAILED",
         (unsigned long)ESP.getFreeHeap(),
         (unsigned long)ESP.getFreePsram(),
-        (unsigned)g_processing_ms,
-        g_qr_fps,
-        g_qr_raw_count,
-        g_qr_decoded_count,
-        g_num_detections,
-        g_last_decode_err,
-        g_last_decode_err_flip,
-        g_track.active ? "true" : "false",
-        g_track.confidence,
-        (unsigned)(g_track.active ? g_track.det.age_ms : 0U),
-        (unsigned)g_frame_id);
+        (unsigned)proc_ms,
+        fps,
+        raw,
+        dec,
+        dets,
+        err,
+        err_f,
+        track_act ? "true" : "false",
+        track_cf,
+        (unsigned)track_age,
+        (unsigned)fid);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -1312,17 +1340,23 @@ static esp_err_t status_handler(httpd_req_t *req) {
 // /platform endpoint: latest platform detection result.
 static esp_err_t platform_handler(httpd_req_t *req) {
     char buf[256];
+    
+    xSemaphoreTake(g_platform_mutex, portMAX_DELAY);
+    PlatformResult plat = g_last_platform;
+    uint32_t p_ms = g_platform_detect_ms;
+    xSemaphoreGive(g_platform_mutex);
+
     snprintf(buf, sizeof(buf),
         "{\"detected\":%s,\"center_x\":%.1f,\"center_y\":%.1f,\"width\":%.1f,\"height\":%.1f,\"angle\":%.1f,\"confidence\":%.3f,\"distance_mm\":%.1f,\"processing_ms\":%u}",
-        g_last_platform.detected ? "true" : "false",
-        g_last_platform.center_x,
-        g_last_platform.center_y,
-        g_last_platform.width_px,
-        g_last_platform.height_px,
-        g_last_platform.angle_deg,
-        g_last_platform.confidence,
-        g_last_platform.distance_mm,
-        (unsigned)g_platform_detect_ms);
+        plat.detected ? "true" : "false",
+        plat.center_x,
+        plat.center_y,
+        plat.width_px,
+        plat.height_px,
+        plat.angle_deg,
+        plat.confidence,
+        plat.distance_mm,
+        (unsigned)p_ms);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -1420,9 +1454,11 @@ static void onEspNowRecv(const esp_now_recv_info_t *recvInfo,
     if (len == sizeof(ScanRequest)) {
         ScanRequest req;
         memcpy(&req, data, sizeof(req));
+        portENTER_CRITICAL_ISR(&g_scan_mux);
         g_scan_task_id = req.task_id;
         g_scan_mode = req.mode;
         g_scan_requested = true;
+        portEXIT_CRITICAL_ISR(&g_scan_mux);
         Serial.printf("[ESPNOW] Scan request: task=%d mode=%d\n", req.task_id, req.mode);
     }
 }
@@ -1501,6 +1537,7 @@ void setup() {
 
     g_data_mutex = xSemaphoreCreateMutex();
     g_cam_mutex = xSemaphoreCreateMutex();
+    g_platform_mutex = xSemaphoreCreateMutex();
 
     initWiFi();
     initEspNow();
@@ -1540,6 +1577,7 @@ void setup() {
                 uint32_t fps_t0 = millis();
                 while (true) {
                     process_qr_frame();
+                    vTaskDelay(1);
                     fps_count++;
                     uint32_t now = millis();
                     if (now - fps_t0 >= 2000) {

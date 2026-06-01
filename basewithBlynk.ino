@@ -5,7 +5,7 @@
 #define BLYNK_PRINT Serial
 #define BLYNK_LOCAL_PORT 8080
 
-bool flag = 0;
+bool autoTrigger = 0;
 
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
@@ -97,6 +97,7 @@ const float KP_POS = 0.005;
 const int8_t MIN_TORQUE = 18;
 const int16_t FINAL_TOLERANCE = 100;
 const long BRAKE_ZONE_TICKS = 1500;
+const uint16_t MOVE_TIMEOUT_ITERATIONS = 5000;
 
 // --- VECTORS ---
 const int8_t V_FORWARD[]    = { 1, -1, -1,  1};
@@ -187,6 +188,7 @@ static bool waitForCameraPose(unsigned long timeout_ms) {
     unsigned long t0 = millis();
     while (!cameraPoseReceived && millis() - t0 < timeout_ms) {
         Blynk.run();
+        if (!autonomousMode) return false;
         delay(20);
     }
 
@@ -222,6 +224,7 @@ static bool alignToQR() {
 
     // Step 2: Align yaw — strafe left/right until centered on QR
     for (int step = 0; step < MAX_ALIGN_STEPS; step++) {
+        if (!autonomousMode) return false;
         if (fabs(lastPoseReply.yaw_deg) <= YAW_THRESHOLD_DEG) break;
 
         if (lastPoseReply.yaw_deg > 0)
@@ -239,6 +242,7 @@ static bool alignToQR() {
 
     // Step 3: Approach — move forward until close enough
     for (int step = 0; step < MAX_APPROACH_STEPS; step++) {
+        if (!autonomousMode) return false;
         if (lastPoseReply.tz_mm <= APPROACH_DISTANCE_MM) break;
 
         manualMove(V_FORWARD, ALIGN_SPEED);
@@ -308,10 +312,7 @@ void manualMove(const int8_t vector[], int8_t speedVal) {
 }
 
 void forceStop() {
-    for (int i = 0; i < 5; i++) {
-        writeSpeeds(0, 0, 0, 0);
-        delay(10);
-    }
+    writeSpeeds(0, 0, 0, 0);
 }
 
 // ================================================================
@@ -322,9 +323,10 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance, floa
 
     int32_t startEncoders[4], currentEncoders[4];
 
-    long targetTicks = (long)abs(distance * tickConstant);
+    long targetTicks = lroundf(fabs(distance * tickConstant));
 
     int8_t localMinTorque = (tickConstant == TICKS_ROTATE) ? 22 : MIN_TORQUE;
+    maxSpeed = max(maxSpeed, localMinTorque);
 
     if (!readEncoders(startEncoders)) return;
 
@@ -333,13 +335,14 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance, floa
     int8_t lastSpeed = -127;
 
     uint8_t loopCounter = 0;
+    uint8_t i2cErrors = 0;
 
     while (true) {
 
         if (loopCounter % 2 == 0) {
 
             if (readEncoders(currentEncoders)) {
-
+                i2cErrors = 0;
                 double totalTraveled = 0;
                 int activeMotors = 0;
 
@@ -347,7 +350,7 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance, floa
 
                     if (vector[i] != 0) {
 
-                        long diff = (long)currentEncoders[i] - (long)startEncoders[i];
+                        int32_t diff = currentEncoders[i] - startEncoders[i];
 
                         totalTraveled += abs(diff);
 
@@ -360,6 +363,12 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance, floa
                 if (traveled >= targetTicks) break;
 
                 error = targetTicks - traveled;
+            } else {
+                i2cErrors++;
+                if (i2cErrors > 5) {
+                    Serial.println("[ERR] I2C encoder read failed 5 times, aborting move");
+                    break;
+                }
             }
         }
 
@@ -384,6 +393,11 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance, floa
                         finalSpeed * vector[3]);
 
             lastSpeed = finalSpeed;
+        }
+
+        if (loopCounter > MOVE_TIMEOUT_ITERATIONS) {
+            Serial.println("[ERR] Move timed out (blocked or stalled), aborting");
+            break;
         }
 
         delay(20);
@@ -561,9 +575,9 @@ BLYNK_WRITE(V9) {
 
 BLYNK_WRITE(V10) {
 
-    autonomousMode = param.asInt();
+    if (param.asInt() && !autonomousMode) autoTrigger = 1;
 
-    flag = 1;
+    autonomousMode = param.asInt();
 
     forceStop();
     isMoving = false;
@@ -797,7 +811,7 @@ void loop() {
         Blynk.virtualWrite(V14, lastPoseReply.tz_mm);
     }
 
-    if (autonomousMode && flag == 1)
+    if (autonomousMode && autoTrigger == 1)
     {
         Serial.println("[AUTO] Starting camera-guided autonomous pickup");
 
@@ -813,6 +827,7 @@ void loop() {
         };
 
         for (int i = 0; i < 3; i++) {
+            if (!autonomousMode) break;
             Serial.printf("[AUTO] --- Target %d: %s ---\n", i + 1, targets[i].label);
 
             if (!alignToQR()) {
@@ -820,11 +835,19 @@ void loop() {
                 continue;
             }
 
+            if (!autonomousMode) break;
+
             // Check detected color matches expected target
             if (lastPoseReply.color == targets[i].colorCode) {
                 Serial.printf("[AUTO] Color match: %s — sending arm command\n", targets[i].label);
                 sendCommandToArm(targets[i].armCmd);
-                delay(9000);
+                
+                unsigned long t0 = millis();
+                while (millis() - t0 < 9000) {
+                    Blynk.run();
+                    if (!autonomousMode) break;
+                    delay(50);
+                }
             } else {
                 const char *colorNames[] = {"NONE", "RED", "GREEN", "BLUE"};
                 int ci = lastPoseReply.color;
@@ -834,9 +857,9 @@ void loop() {
             }
         }
 
-        sendCommandToArm("H");
+        if (autonomousMode) sendCommandToArm("H");
         forceStop();
-        flag = 0;
+        autoTrigger = 0;
         Serial.println("[AUTO] Autonomous pickup complete");
     }
 }
