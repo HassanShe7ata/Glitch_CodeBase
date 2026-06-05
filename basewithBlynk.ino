@@ -10,6 +10,16 @@ bool autoTrigger = 0;
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
 
+// ================= ESP-NOW SHARED ENUMS =================
+// These must match the definitions in camera firmware (main.cpp)
+// and arm firmware (unused there but kept for consistency).
+enum ArmColorCode : uint8_t {
+    ARM_COLOR_UNKNOWN = 0,
+    ARM_COLOR_R       = 1,
+    ARM_COLOR_G       = 2,
+    ARM_COLOR_B       = 3,
+};
+
 // Your authentication token (get this from Blynk Legacy server after creating project)
 char auth[] = "Kspg0_T5ov2BDlZ3-HMLCJoOoWtlRrqV";
 
@@ -38,9 +48,10 @@ struct_message armMessage;
 esp_now_peer_info_t peerInfo;
 
 // =================== CAMERA ESP-NOW ===================
-// Camera ESP32-S3 MAC Address — update when you read it from Serial Monitor
-// Camera prints "CAMERA MAC: xx:xx:xx:xx:xx:xx" on boot
-static uint8_t cameraAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // CHANGE THIS
+// ⚠️  MUST UPDATE: Run camera once and read Serial Monitor for "CAMERA MAC: xx:xx:xx:xx:xx:xx"
+// Replace the FF placeholder below with the actual 6-byte MAC address.
+// ESP-NOW cannot use broadcast (FF:FF:FF:FF:FF:FF) as a peer address.
+static uint8_t cameraAddress[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // ← UPDATE THIS
 
 // ESP-NOW packet: Base → Camera (scan request)
 struct __attribute__((packed)) ScanRequest {
@@ -63,8 +74,10 @@ struct __attribute__((packed)) PoseReply {
 };
 
 // Latest camera pose data (updated by ESP-NOW callback)
+// Marked volatile because OnDataRecv (ISR callback) writes it
+// while alignToQR() / waitForCameraPose() read it in the main loop.
 static volatile bool cameraPoseReceived = false;
-static PoseReply lastPoseReply = {};
+static volatile PoseReply lastPoseReply;
 
 // Movement watchdog
 static bool isMoving = false;
@@ -635,11 +648,11 @@ BLYNK_WRITE(V24) {
 }
 
 BLYNK_WRITE(V25) {
-    Motor_speed = param.asInt();  // slider value from Blynk
-
+    int raw = param.asInt();
+    // Constrain to int8_t safe range [0, 100] to prevent overflow
+    Motor_speed = (int8_t)constrain(raw, 0, 100);
     Serial.print("Motor Speed Updated: ");
     Serial.println(Motor_speed);
-        // reflect immediately on gauge
     Blynk.virtualWrite(V23, Motor_speed);
 }
 

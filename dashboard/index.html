@@ -1291,8 +1291,8 @@
 
             document.getElementById('plat-dist').textContent = p.detected ? `${p.distance_mm.toFixed(0)} mm` : '—';
             document.getElementById('plat-center').textContent = p.detected ? `${p.center_x.toFixed(0)}, ${p.center_y.toFixed(0)}` : '—, —';
-            document.getElementById('plat-size').textContent = p.detected ? `${p.width.toFixed(0)} × ${p.height.toFixed(0)}` : '— × —';
-            document.getElementById('plat-angle').textContent = p.detected ? `${p.angle.toFixed(1)}°` : '—°';
+            document.getElementById('plat-size').textContent = p.detected ? `${p.width_px.toFixed(0)} × ${p.height_px.toFixed(0)}` : '— × —';
+            document.getElementById('plat-angle').textContent = p.detected ? `${p.angle_deg.toFixed(1)}°` : '—°';
             document.getElementById('plat-proc').textContent = `${p.processing_ms} ms`;
 
             // Confidence bar
