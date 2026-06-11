@@ -26,6 +26,21 @@ typedef struct struct_message {
 
 struct_message incomingMessage;
 
+// Camera pose data forwarded by base via ESP-NOW (size differs from struct_message)
+struct __attribute__((packed)) CameraPoseData {
+    uint8_t type;        // 1 = camera pose packet
+    uint8_t pose_valid;
+    uint8_t color;
+    uint8_t estimated;
+    float tx_mm;
+    float ty_mm;
+    float tz_mm;
+    float yaw_deg;
+    float confidence;
+};
+
+static CameraPoseData incomingCameraPose;
+
 // --- GRIPPER SETTINGS ---
 #define GRIP_CH 4
 
@@ -61,6 +76,21 @@ const float L2 = 119.76;
 const float L3 = 52.52;
 const float L4 = 105.00;
 const float L5 = 97.3;
+
+// ================================================================
+// CAMERA-TO-LINK4 TRANSFORM
+// ================================================================
+// Fixed extrinsics: camera frame → link4 end effector frame (given by calibration)
+// Transforms a point P_cam in camera frame to P_l4 in link4 frame:
+//   [P_l4] = T_CAM_TO_L4 * [P_cam]
+// Axes mapping: x_cam→z_l4, y_cam→-y_l4, z_cam→x_l4
+// Translation: camera origin is at (-5.9, 6.35, 0) in link4 frame
+static const float T_CAM_TO_L4[4][4] = {
+    { 0.0f,  0.0f,  1.0f,  -5.9f    },
+    { 0.0f, -1.0f,  0.0f,   6.35f   },
+    { 1.0f,  0.0f,  0.0f,   0.0f    },
+    { 0.0f,  0.0f,  0.0f,   1.0f    }
+};
 
 // ================================================================
 // STRUCT
@@ -213,15 +243,12 @@ void moveServo(int servoIndex, float angle) {
   Serial.printf("\n--------------------------------------------------\n");
   Serial.printf("INPUT -> Move Servo %d to %.1f\n", servoIndex, angle);
 
-  // Keep all other servos at their current angles
   for (int i = 0; i < NUM_SERVOS; i++) {
     targetAngles[i] = currentAngle[i]; 
   }
 
-  // Set the new target angle for the chosen servo
   targetAngles[servoIndex] = angle;
 
-  // Execute the smooth, synchronized movement
   executeSyncMove();
 
   Serial.printf("REACHED -> T1:%.1f T2:%.1f T3:%.1f T4:%.1f G:%.1f\n",
@@ -231,6 +258,64 @@ void moveServo(int servoIndex, float angle) {
                 currentAngle[3],
                 currentAngle[4]);
   Serial.println("--------------------------------------------------");
+}
+
+// ================================================================
+// FORWARD KINEMATICS
+// ================================================================
+// Given joint angles t1..t4, compute link4 end effector pose (x,y,z,phi) in arm base frame.
+// phi = tool pitch angle from horizontal (degrees).
+static void forwardKinematics(float t1, float t2, float t3, float t4,
+                               float &x, float &y, float &z, float &phi_deg) {
+  float d1  = atan2(L3, L2);
+  float t1r = t1 * PI / 180.0f;
+  float t2r = t2 * PI / 180.0f;
+  float t3r = t3 * PI / 180.0f;
+  float t4r = t4 * PI / 180.0f;
+
+  float q2 = t2r - d1;
+  float q3 = t3r - d1;
+
+  float phi = q2 - q3 + (PI/2.0f - t4r);
+
+  float R_up = sqrt(L2*L2 + L3*L3);
+
+  float R_elbow = R_up * cos(q2);
+  float Z_elbow = L1 + R_up * sin(q2);
+
+  float R_wrist = R_elbow + L4 * cos(q2 - q3);
+  float Z_wrist = Z_elbow + L4 * sin(q2 - q3);
+
+  float R_ee = R_wrist + L5 * cos(phi);
+  float Z_ee = Z_wrist + L5 * sin(phi);
+
+  x = R_ee * cos(t1r);
+  y = R_ee * sin(t1r);
+  z = Z_ee;
+  phi_deg = phi * 180.0f / PI;
+}
+
+// ================================================================
+// CAMERA-FRAME → ARM-BASE-FRAME TRANSFORM
+// ================================================================
+static void cameraToBase(float tx_cam, float ty_cam, float tz_cam,
+                          float &x_base, float &y_base, float &z_base) {
+  float l4x, l4y, l4z, l4phi;
+  forwardKinematics(currentAngle[0], currentAngle[1],
+                    currentAngle[2], currentAngle[3],
+                    l4x, l4y, l4z, l4phi);
+
+  float dx = T_CAM_TO_L4[0][0]*tx_cam + T_CAM_TO_L4[0][1]*ty_cam +
+             T_CAM_TO_L4[0][2]*tz_cam + T_CAM_TO_L4[0][3];
+  float dy = T_CAM_TO_L4[1][0]*tx_cam + T_CAM_TO_L4[1][1]*ty_cam +
+             T_CAM_TO_L4[1][2]*tz_cam + T_CAM_TO_L4[1][3];
+  float dz = T_CAM_TO_L4[2][0]*tx_cam + T_CAM_TO_L4[2][1]*ty_cam +
+             T_CAM_TO_L4[2][2]*tz_cam + T_CAM_TO_L4[2][3];
+
+  float t1r = currentAngle[0] * PI / 180.0f;
+  x_base = l4x + dx*cos(t1r) - dy*sin(t1r);
+  y_base = l4y + dx*sin(t1r) + dy*cos(t1r);
+  z_base = l4z + dz;
 }
 
 // ================================================================
@@ -299,6 +384,54 @@ void scanPose() {
   Serial.println("\n[SYSTEM] Moving to Scan Pose");
 
   moveRobot(0, 150, 200, -45, 0);
+}
+
+// ================================================================
+// CAMERA-GUIDED PICKUP
+// ================================================================
+// Called when camera pose data arrives via ESP-NOW.
+// Transforms QR from camera frame → arm base frame → IK → execute.
+static void cameraGuidedPickup() {
+  CameraPoseData *p = &incomingCameraPose;
+
+  if (!p->pose_valid) {
+    Serial.println("[CAM] Ignoring invalid pose");
+    return;
+  }
+
+  Serial.printf("[CAM] Guided pickup: color=%d conf=%.2f "
+                "qr=(%.0f,%.0f,%.0f) yaw=%.1f\n",
+                p->color, p->confidence,
+                p->tx_mm, p->ty_mm, p->tz_mm, p->yaw_deg);
+
+  // 1. Convert QR position from camera frame → arm base frame
+  float x_qr, y_qr, z_qr;
+  cameraToBase(p->tx_mm, p->ty_mm, p->tz_mm, x_qr, y_qr, z_qr);
+
+  Serial.printf("[CAM] QR in base frame: (%.0f, %.0f, %.0f)\n",
+                x_qr, y_qr, z_qr);
+
+  // 2. Approach: move 40mm above QR with gripper open
+  moveRobot(x_qr, y_qr, z_qr + 40, -90, 0);
+
+  // 3. Descend to QR
+  moveRobot(x_qr, y_qr, z_qr, -90, 0);
+
+  // 4. Close gripper
+  moveRobot(x_qr, y_qr, z_qr, -90, 1);
+
+  delay(200);
+
+  // 5. Lift QR
+  moveRobot(x_qr, y_qr, z_qr + 40, -90, 1);
+
+  // 6. Go to home with object
+  goHome();
+
+  // 7. TODO: add drop-off based on p->color to a dedicated location
+  //    (see GreenToFloor, BlueToFloor, RedToFloor for color-based drops)
+
+  Serial.println("[CAM] Camera-guided pickup complete");
 }
 
 // ================================================================
@@ -448,6 +581,25 @@ void FromCarToRod() {
 void OnDataRecv(const esp_now_recv_info_t *recvInfo,
                 const uint8_t *incomingData,
                 int len) {
+
+  // Camera pose data packet (larger than command string)
+  if (len == sizeof(CameraPoseData)) {
+    memcpy(&incomingCameraPose, incomingData, sizeof(CameraPoseData));
+
+    Serial.println("\n==============================");
+    Serial.print("ESP-NOW CAMERA POSE RECEIVED: valid=");
+    Serial.print(incomingCameraPose.pose_valid);
+    Serial.print(" color=");
+    Serial.print(incomingCameraPose.color);
+    Serial.print(" conf=");
+    Serial.print(incomingCameraPose.confidence);
+    Serial.print(" tz=");
+    Serial.print(incomingCameraPose.tz_mm);
+    Serial.println("==============================");
+
+    cameraGuidedPickup();
+    return;
+  }
 
   memcpy(&incomingMessage,
          incomingData,

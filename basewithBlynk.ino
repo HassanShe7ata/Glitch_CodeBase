@@ -73,6 +73,19 @@ struct __attribute__((packed)) PoseReply {
     float confidence;
 };
 
+// ESP-NOW packet: Base → Arm (camera pose data for guided IK)
+struct __attribute__((packed)) CameraPoseData {
+    uint8_t type;        // 1 = camera pose packet
+    uint8_t pose_valid;
+    uint8_t color;
+    uint8_t estimated;
+    float tx_mm;
+    float ty_mm;
+    float tz_mm;
+    float yaw_deg;
+    float confidence;
+};
+
 // Latest camera pose data (updated by ESP-NOW callback)
 // Marked volatile because OnDataRecv (ISR callback) writes it
 // while alignToQR() / waitForCameraPose() read it in the main loop.
@@ -188,6 +201,31 @@ void sendScanRequest(uint8_t mode) {
 
     Serial.printf("[CAM] Scan request sent: task=%d mode=%d (%s)\n",
                   req.task_id, req.mode,
+                  result == ESP_OK ? "OK" : "FAILED");
+}
+
+// Forward the latest camera PoseReply to the arm for camera-guided IK.
+void sendCameraPoseToArm() {
+    CameraPoseData data = {};
+    data.type        = 1;
+    data.pose_valid  = lastPoseReply.pose_valid;
+    data.color       = lastPoseReply.color;
+    data.estimated   = lastPoseReply.estimated;
+    data.tx_mm       = lastPoseReply.tx_mm;
+    data.ty_mm       = lastPoseReply.ty_mm;
+    data.tz_mm       = lastPoseReply.tz_mm;
+    data.yaw_deg     = lastPoseReply.yaw_deg;
+    data.confidence  = lastPoseReply.confidence;
+
+    esp_err_t result = esp_now_send(armAddress,
+                                    (uint8_t *)&data,
+                                    sizeof(data));
+
+    Serial.printf("[BASE] Camera pose forwarded to arm: valid=%d color=%d "
+                  "tx=%.0f ty=%.0f tz=%.0f yaw=%.1f conf=%.2f (%s)\n",
+                  data.pose_valid, data.color,
+                  data.tx_mm, data.ty_mm, data.tz_mm, data.yaw_deg,
+                  data.confidence,
                   result == ESP_OK ? "OK" : "FAILED");
 }
 
@@ -895,11 +933,14 @@ void loop() {
 
             // Check detected color matches expected target
             if (lastPoseReply.color == targets[i].colorCode) {
-                Serial.printf("[AUTO] Color match: %s — sending arm command\n", targets[i].label);
-                sendCommandToArm(targets[i].armCmd);
-                
+                Serial.printf("[AUTO] Color match: %s — sending camera pose to arm\n", targets[i].label);
+
+                // Forward camera pose to arm for dynamic IK pickup
+                sendCameraPoseToArm();
+
+                // Wait for arm to complete (cameraGuidedPickup on arm handles its own goHome)
                 unsigned long t0 = millis();
-                while (millis() - t0 < 9000) {
+                while (millis() - t0 < 12000) {
                     Blynk.run();
                     if (!autonomousMode) break;
                     delay(50);
