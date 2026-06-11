@@ -89,7 +89,7 @@ int angleToPulse(float angle) {
 void executeSyncMove() {
 
   unsigned long startTime = millis();
-
+ 
   float maxDelta = 0;
   for(int i = 0; i < 5; i++) {
     startAngles[i] = currentAngle[i];
@@ -198,6 +198,39 @@ JointAngles calculateIK(float x, float y, float z, float phi_deg) {
   angles.reachable = true;
 
   return angles;
+}
+
+// ================================================================
+// MOVE SINGLE SERVO
+// ================================================================
+
+void moveServo(int servoIndex, float angle) {
+  if (servoIndex < 0 || servoIndex >= NUM_SERVOS) {
+    Serial.println("[!] ERROR: Invalid Servo Index");
+    return;
+  }
+
+  Serial.printf("\n--------------------------------------------------\n");
+  Serial.printf("INPUT -> Move Servo %d to %.1f\n", servoIndex, angle);
+
+  // Keep all other servos at their current angles
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    targetAngles[i] = currentAngle[i]; 
+  }
+
+  // Set the new target angle for the chosen servo
+  targetAngles[servoIndex] = angle;
+
+  // Execute the smooth, synchronized movement
+  executeSyncMove();
+
+  Serial.printf("REACHED -> T1:%.1f T2:%.1f T3:%.1f T4:%.1f G:%.1f\n",
+                currentAngle[0],
+                currentAngle[1],
+                currentAngle[2],
+                currentAngle[3],
+                currentAngle[4]);
+  Serial.println("--------------------------------------------------");
 }
 
 // ================================================================
@@ -333,8 +366,6 @@ void GreenToCar() {
 
   Serial.println("[ACTION] Green To Car");
 
-  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0);
-  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
 
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
@@ -358,8 +389,6 @@ void BlueToCar() {
 
   Serial.println("[ACTION] Blue To Car");
 
-  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0);
-  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
 
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
@@ -383,8 +412,6 @@ void RedToCar() {
 
   Serial.println("[ACTION] Red To Car");
 
-  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0);
-  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
 
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
@@ -403,6 +430,16 @@ void RedToCar() {
 
   goHome();
 }
+
+void FromCarToRod() {
+
+  Serial.println("[ACTION] From Car To Rod");
+
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
+
+}
+
 
 // ================================================================
 // ESP NOW RECEIVE CALLBACK
@@ -452,6 +489,10 @@ void OnDataRecv(const esp_now_recv_info_t *recvInfo,
   else if (strcmp(cmd, "S") == 0) {
     scanPose();
     Serial.print("S");
+  }
+  else if (strcmp(cmd, "FCTR") == 0) {
+    FromCarToRod();
+    Serial.print("FCTR");
   }
   else
     Serial.println("[ERROR] Unknown Command");

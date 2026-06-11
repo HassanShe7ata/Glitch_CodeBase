@@ -51,7 +51,7 @@ esp_now_peer_info_t peerInfo;
 // ⚠️  MUST UPDATE: Run camera once and read Serial Monitor for "CAMERA MAC: xx:xx:xx:xx:xx:xx"
 // Replace the FF placeholder below with the actual 6-byte MAC address.
 // ESP-NOW cannot use broadcast (FF:FF:FF:FF:FF:FF) as a peer address.
-static uint8_t cameraAddress[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // ← UPDATE THIS
+static uint8_t cameraAddress[] = {0x94, 0xA9, 0x90, 0x08, 0xB2, 0xB8};
 
 // ESP-NOW packet: Base → Camera (scan request)
 struct __attribute__((packed)) ScanRequest {
@@ -654,6 +654,49 @@ BLYNK_WRITE(V25) {
     Serial.print("Motor Speed Updated: ");
     Serial.println(Motor_speed);
     Blynk.virtualWrite(V23, Motor_speed);
+}
+
+// ===================== NEW ARM COMMANDS =====================
+
+// V15 — Green To Floor
+BLYNK_WRITE(V15) {
+    if (param.asInt()) {
+        sendCommandToArm("GTF");
+        Serial.println("GTF");
+    }
+}
+
+// V27 — From Car To Rod
+BLYNK_WRITE(V27) {
+    if (param.asInt()) {
+        sendCommandToArm("FCTR");
+        Serial.println("FCTR");
+    }
+}
+
+// V28 — Servo Index selector (slider 0-4, stores value for V30)
+int selectedServo = 0;
+BLYNK_WRITE(V28) {
+    selectedServo = constrain(param.asInt(), 0, 4);
+    Serial.printf("[SERVO] Selected servo: %d\n", selectedServo);
+}
+
+// V29 — Servo Angle selector (slider 0-180, stores value for V30)
+int selectedAngle = 90;
+BLYNK_WRITE(V29) {
+    selectedAngle = constrain(param.asInt(), 0, 180);
+    Serial.printf("[SERVO] Selected angle: %d\n", selectedAngle);
+}
+
+// V30 — Send Servo Move command (button)
+BLYNK_WRITE(V30) {
+    if (param.asInt()) {
+        // Format: "SV:index:angle" e.g. "SV:0:90"
+        char cmd[10];
+        snprintf(cmd, sizeof(cmd), "SV:%d:%d", selectedServo, selectedAngle);
+        sendCommandToArm(cmd);
+        Serial.printf("[SERVO] Sent: %s\n", cmd);
+    }
 }
 
 // ===================== CAMERA SCAN COMMANDS =====================
