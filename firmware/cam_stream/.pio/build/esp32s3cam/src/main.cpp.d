@@ -207,6 +207,8 @@
  C:/Users/Altyseer/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiUdp.h \
  C:/Users/Altyseer/.platformio/packages/framework-arduinoespressif32/cores/esp32/Udp.h \
  C:/Users/Altyseer/.platformio/packages/framework-arduinoespressif32/cores/esp32/cbuf.h \
+ C:/Users/Altyseer/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/esp_wifi/include/esp_now.h \
+ C:/Users/Altyseer/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/esp_wifi/include/esp_wifi_types.h \
  C:/Users/Altyseer/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/esp_http_server/include/esp_http_server.h \
  C:/Users/Altyseer/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/nghttp/port/include/http_parser.h \
- lib/quirc/quirc.h src/arm_pose_link.h
+ lib/quirc/quirc.h src/platform_detect.h

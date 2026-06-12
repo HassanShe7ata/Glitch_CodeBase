@@ -22,7 +22,7 @@
 
 static const char *ap_ssid = "ESP32S3-CAM";
 static const char *ap_password = "12345678";
-static const char *sta_ssid = "hassan's-laptop-hotspot";
+static const char *sta_ssid = "GLITCH";
 static const char *sta_password = "12345678";
 
 // =================== QR COLOR PARSING ===================
@@ -1449,7 +1449,7 @@ static bool initCamera() {
 }
 
 // ESP-NOW callback: receive scan requests from base
-static void onEspNowRecv(const esp_now_recv_info_t *recvInfo,
+static void onEspNowRecv(const uint8_t *mac,
                          const uint8_t *data, int len) {
     if (len == sizeof(ScanRequest)) {
         ScanRequest req;

@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Glitch — Robot Controller</title>
+    <meta name="theme-color" content="#0a0e17">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <style>
+        :root {
+            --bg: #0a0e17;
+            --panel: #111827;
+            --panel-2: #1f2937;
+            --border: rgba(99,102,241,0.25);
+            --text: #f1f5f9;
+            --muted: #94a3b8;
+            --accent: #818cf8;
+            --accent-glow: rgba(129,140,248,0.4);
+            --ok: #34d399;
+            --warn: #fbbf24;
+            --err: #fb7185;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+        html, body { background: var(--bg); color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            min-height: 100vh; }
+        body { padding: 14px; padding-bottom: env(safe-area-inset-bottom); max-width: 520px; margin: 0 auto; }
+        h1 { font-size: 22px; font-weight: 800; margin-bottom: 4px;
+            background: linear-gradient(135deg, #818cf8, #22d3ee);
+            -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+        .card { background: var(--panel); border: 1px solid var(--border);
+            border-radius: 14px; padding: 14px; margin-bottom: 12px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.25); }
+        .card h2 { font-size: 11px; color: var(--muted); font-weight: 600;
+            text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+        .status-row { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err);
+            transition: box-shadow 200ms; }
+        .dot.ok { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+        .dot.warn { background: var(--warn); box-shadow: 0 0 10px var(--warn); }
+        button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+            border-radius: 10px; padding: 14px 8px; font-size: 14px; font-weight: 600;
+            cursor: pointer; user-select: none; -webkit-user-select: none;
+            transition: background 80ms, transform 80ms, box-shadow 200ms; touch-action: manipulation; }
+        button:active { background: var(--accent); transform: scale(0.96);
+            box-shadow: 0 0 16px var(--accent-glow); }
+        button.active { background: var(--accent); border-color: var(--accent);
+            box-shadow: 0 0 12px var(--accent-glow); }
+        button.danger:active { background: var(--err); }
+        .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; aspect-ratio: 1.4; }
+        .pad button { font-size: 26px; padding: 0; }
+        .pad .empty { visibility: hidden; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+        .slider-row { display: flex; align-items: center; gap: 10px; }
+        .slider-row input[type="range"] { flex: 1; accent-color: var(--accent); height: 6px; }
+        .slider-row .val { font-family: 'JetBrains Mono', 'Courier New', monospace; font-weight: 700;
+            min-width: 40px; text-align: right; font-size: 16px; }
+        .telemetry { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .tile { background: var(--panel-2); border-radius: 10px; padding: 10px; }
+        .tile .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+        .tile .val { font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 20px; font-weight: 700; margin-top: 2px; }
+        .tile .val.small { font-size: 14px; }
+        .log { font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 11px;
+            color: var(--muted); max-height: 130px; overflow-y: auto;
+            background: var(--panel-2); border-radius: 8px; padding: 8px; }
+        .log .err { color: var(--err); }
+        .log .ok  { color: var(--ok); }
+        .log .recv { color: #22d3ee; }
+        .section-label { font-size: 10px; color: var(--muted); margin: 4px 0 6px; }
+    </style>
+</head>
+<body>
+    <h1>Glitch</h1>
+    <div class="sub" id="connStatus"><span class="dot"></span><span>connecting…</span></div>
+
+    <div class="card">
+        <h2>Drive</h2>
+        <div class="pad">
+            <div class="empty"></div>
+            <button id="btnFwd"   data-cmd="MOVE" data-arg="FWD">▲</button>
+            <div class="empty"></div>
+            <button id="btnLeft"  data-cmd="MOVE" data-arg="LEFT">◀</button>
+            <button id="btnStop"  data-cmd="MOVE" data-arg="STOP" class="danger">■</button>
+            <button id="btnRight" data-cmd="MOVE" data-arg="RIGHT">▶</button>
+            <div class="empty"></div>
+            <button id="btnBack"  data-cmd="MOVE" data-arg="BACK">▼</button>
+            <div class="empty"></div>
+        </div>
+        <div class="section-label" style="margin-top:14px">Motor Speed</div>
+        <div class="slider-row">
+            <input type="range" id="speed" min="0" max="80" value="40">
+            <span class="val" id="speedVal">40</span>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Arm Commands</h2>
+        <div class="grid-2">
+            <button data-cmd="ARM" data-arg="GTF">Green → Floor</button>
+            <button data-cmd="ARM" data-arg="BTC">Blue → Car</button>
+            <button data-cmd="ARM" data-arg="RTC">Red → Car</button>
+            <button data-cmd="ARM" data-arg="GTC">Green → Car</button>
+            <button data-cmd="ARM" data-arg="HOME" class="danger">Home</button>
+            <button data-cmd="ARM" data-arg="RTF">Red → Floor</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Mode</h2>
+        <div class="grid-2">
+            <button id="btnAuto" data-cmd="AUTO" data-arg="TOGGLE">Autonomous</button>
+            <button data-cmd="SCAN" data-arg="QR">Scan QR</button>
+            <button data-cmd="SCAN" data-arg="PLAT">Scan Platform</button>
+            <button data-cmd="POSE" data-arg="ARM">Arm Pose</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Live Telemetry</h2>
+        <div class="telemetry">
+            <div class="tile"><div class="label">Confidence</div><div class="val" id="tConf">—</div></div>
+            <div class="tile"><div class="label">Yaw °</div><div class="val" id="tYaw">—</div></div>
+            <div class="tile"><div class="label">Color</div><div class="val" id="tColor">—</div></div>
+            <div class="tile"><div class="label">Distance mm</div><div class="val" id="tDist">—</div></div>
+            <div class="tile"><div class="label">Motor Speed</div><div class="val" id="tSpeed">—</div></div>
+            <div class="tile"><div class="label">Heap / State</div><div class="val small" id="tHeap">—</div></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Event Log</h2>
+        <div class="log" id="log"></div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script>
+        const $ = (id) => document.getElementById(id);
+        const log = (msg, cls='') => {
+            const el = $('log');
+            const t = new Date().toLocaleTimeString();
+            el.innerHTML = `<div class="${cls}">[${t}] ${msg}</div>` + el.innerHTML;
+            while (el.children.length > 80) el.removeChild(el.lastChild);
+        };
+        const setStatus = (cls, text) => {
+            $('connStatus').innerHTML = `<span class="dot ${cls}"></span><span>${text}</span>`;
+        };
+
+        // ── Socket.IO connection to laptop's Flask server ─────────────────
+        const socket = io({ transports: ['websocket', 'polling'] });
+
+        socket.on('connect', () => { setStatus('ok', 'connected to server'); log('socket connected', 'ok'); });
+        socket.on('disconnect', () => { setStatus('', 'disconnected'); log('socket disconnected', 'err'); });
+        socket.on('telemetry', (s) => {
+            $('tConf').textContent  = (s.confidence*100).toFixed(0) + '%';
+            $('tYaw').textContent   = s.yaw.toFixed(1);
+            $('tColor').textContent = s.color;
+            $('tDist').textContent  = s.distance_mm;
+            $('tSpeed').textContent = s.motor_speed;
+            $('tHeap').textContent  = (s.free_heap/1024).toFixed(0) + 'kB / ' + (s.autonomous?'AUTO':'IDLE');
+            if (s.connected) {
+                setStatus('ok', `Base online · ${s.base_ip || '—'}`);
+            } else {
+                setStatus('warn', 'Base ESP32 not connected');
+            }
+        });
+        socket.on('esp_log', (msg) => log('ESP32: ' + msg, 'recv'));
+
+        const send = (data) => socket.emit('cmd', data);
+
+        // ── D-pad: push & hold ────────────────────────────────────────────
+        const driveBtns = document.querySelectorAll('.pad button[data-cmd="MOVE"]');
+        driveBtns.forEach(b => {
+            const start = (e) => { e.preventDefault(); b.classList.add('active'); send({cmd:'MOVE', arg:b.dataset.arg}); };
+            const end   = (e) => { e.preventDefault(); b.classList.remove('active'); if (b.dataset.arg !== 'STOP') send({cmd:'MOVE', arg:'STOP'}); };
+            b.addEventListener('touchstart', start, { passive: false });
+            b.addEventListener('touchend', end, { passive: false });
+            b.addEventListener('touchcancel', end, { passive: false });
+            b.addEventListener('mousedown', start);
+            b.addEventListener('mouseup', end);
+            b.addEventListener('mouseleave', end);
+        });
+
+        // ── Single-shot buttons ────────────────────────────────────────────
+        document.querySelectorAll('button[data-cmd]').forEach(b => {
+            if (b.closest('.pad')) return; // already handled
+            b.addEventListener('click', () => send({cmd:b.dataset.cmd, arg:b.dataset.arg}));
+        });
+        // Autonomous is a toggle
+        $('btnAuto').addEventListener('click', () => $('btnAuto').classList.toggle('active'));
+
+        // ── Speed slider (debounced) ───────────────────────────────────────
+        let speedT;
+        $('speed').addEventListener('input', (e) => { $('speedVal').textContent = e.target.value; });
+        $('speed').addEventListener('input', (e) => {
+            clearTimeout(speedT);
+            speedT = setTimeout(() => send({cmd:'SPEED', arg: parseInt(e.target.value)}), 120);
+        });
+
+        // ── Keyboard arrows for laptop use ─────────────────────────────────
+        const keyMap = { ArrowUp:'FWD', ArrowDown:'BACK', ArrowLeft:'LEFT', ArrowRight:'RIGHT' };
+        let keysDown = new Set();
+        document.addEventListener('keydown', e => {
+            if (keyMap[e.key] && !keysDown.has(e.key)) {
+                keysDown.add(e.key); send({cmd:'MOVE', arg: keyMap[e.key]});
+            }
+            if (e.key === ' ') { e.preventDefault(); send({cmd:'MOVE', arg:'STOP'}); }
+        });
+        document.addEventListener('keyup', e => {
+            if (keyMap[e.key]) { keysDown.delete(e.key); send({cmd:'MOVE', arg:'STOP'}); }
+        });
+    </script>
+</body>
+</html>

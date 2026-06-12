@@ -1,3 +1,6 @@
+#include <Arduino.h>
+void setServoAngle(int num, int ang);
+
 // =========================== ARM ESP32 CODE ===========================
 
 #include <Wire.h>
@@ -7,7 +10,7 @@
 #include <WiFi.h>
 
 // ================= WIFI =================
-char ssid[] = "hassan's-laptop-hotspot";
+char ssid[] = "GLITCH";
 char pass[] = "12345678";
 
 // ================= PCA9685 =================
@@ -578,9 +581,7 @@ void FromCarToRod() {
 // ESP NOW RECEIVE CALLBACK
 // ================================================================
 
-void OnDataRecv(const esp_now_recv_info_t *recvInfo,
-                const uint8_t *incomingData,
-                int len) {
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 
   // Camera pose data packet (larger than command string)
   if (len == sizeof(CameraPoseData)) {
@@ -645,6 +646,15 @@ void OnDataRecv(const esp_now_recv_info_t *recvInfo,
   else if (strcmp(cmd, "FCTR") == 0) {
     FromCarToRod();
     Serial.print("FCTR");
+  }
+  else if (strncmp(cmd, "SV:", 3) == 0) {
+    int idx, angle;
+    if (sscanf(cmd, "SV:%d:%d", &idx, &angle) == 2) {
+      if (idx >= 0 && idx < NUM_SERVOS && angle >= 0 && angle <= 180) {
+        moveServo(idx, (float)angle);
+        Serial.printf("SV:%d:%d\n", idx, angle);
+      }
+    }
   }
   else
     Serial.println("[ERROR] Unknown Command");

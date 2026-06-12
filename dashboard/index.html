@@ -780,9 +780,9 @@
                     <span class="connection-dot"></span>
                     <span>Camera</span>
                 </div>
-                <div id="badge-blynk" class="connection-badge error">
+                <div id="badge-base" class="connection-badge error">
                     <span class="connection-dot"></span>
-                    <span>Blynk</span>
+                    <span>Base WS</span>
                 </div>
             </div>
         </header>
@@ -1059,16 +1059,14 @@
        State
        ═══════════════════════════════════════════ */
     let camIP = '';
-    let blynkIP = '';
-    let blynkPort = '';
-    let blynkToken = '';
+    let baseIP = '';
     let polling = false;
     let dataInterval = null;
     let statusInterval = null;
-    let blynkInterval = null;
     let platformInterval = null;
     let cameraConnected = false;
-    let blynkConnected = false;
+    let baseConnected = false;
+    let baseWs = null;
     let lastDataTime = 0;
 
     /* ═══════════════════════════════════════════
@@ -1099,9 +1097,7 @@
        ═══════════════════════════════════════════ */
     function connectAll() {
         camIP = document.getElementById('input-cam-ip').value.trim();
-        blynkIP = document.getElementById('input-blynk-ip').value.trim();
-        blynkPort = document.getElementById('input-blynk-port').value.trim();
-        blynkToken = document.getElementById('input-blynk-token').value.trim();
+        baseIP = document.getElementById('input-base-ip').value.trim();
 
         if (!camIP) {
             log('err', 'Camera IP is required.');
@@ -1142,11 +1138,38 @@
         platformInterval = setInterval(fetchPlatform, 1000);
         fetchPlatform();
 
-        // Start polling Blynk API every 3s (motor speed)
-        if (blynkIP && blynkToken) {
-            log('sys', `Connecting to Blynk at ${blynkIP}:${blynkPort}...`);
-            blynkInterval = setInterval(fetchBlynk, 3000);
-            fetchBlynk();
+        // Connect to Base WebSocket
+        if (baseIP) {
+            log('sys', `Connecting to Base WS at ${baseIP}...`);
+            baseWs = new WebSocket(`ws://${baseIP}/ws`);
+            baseWs.onopen = () => {
+                baseConnected = true;
+                updateConnectionBadge('badge-base', true);
+                log('sys', 'Base WS connected.');
+            };
+            baseWs.onclose = () => {
+                baseConnected = false;
+                updateConnectionBadge('badge-base', false);
+                log('err', 'Base WS disconnected.');
+            };
+            baseWs.onmessage = (e) => {
+                try {
+                    const d = JSON.parse(e.data);
+                    if (d.motor_speed !== undefined) {
+                        const speed = d.motor_speed;
+                        document.getElementById('health-motor').textContent = speed;
+                        
+                        const maxSpeed = 100;
+                        const pct = Math.min(speed / maxSpeed, 1);
+                        const circumference = 2 * Math.PI * 42;
+                        const offset = circumference * (1 - pct);
+                        const ringFill = document.getElementById('speed-ring-fill');
+                        ringFill.style.strokeDashoffset = offset;
+                        ringFill.style.stroke = speed > 70 ? 'var(--accent-rose)' : speed > 40 ? 'var(--accent-amber)' : 'var(--accent-emerald)';
+                        document.getElementById('speed-ring-value').textContent = speed;
+                    }
+                } catch(ex){}
+            };
         }
     }
 
@@ -1154,16 +1177,16 @@
         polling = false;
         if (dataInterval) { clearInterval(dataInterval); dataInterval = null; }
         if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
-        if (blynkInterval) { clearInterval(blynkInterval); blynkInterval = null; }
         if (platformInterval) { clearInterval(platformInterval); platformInterval = null; }
+        if (baseWs) { baseWs.close(); baseWs = null; }
 
         document.getElementById('stream-img').src = '';
         document.getElementById('stream-overlay').classList.remove('hidden');
         setBadge('stream-badge', 'OFFLINE', 'offline');
         cameraConnected = false;
-        blynkConnected = false;
+        baseConnected = false;
         updateConnectionBadge('badge-camera', false);
-        updateConnectionBadge('badge-blynk', false);
+        updateConnectionBadge('badge-base', false);
         log('sys', 'Disconnected.');
     }
 
@@ -1345,37 +1368,8 @@
     }
 
     /* ═══════════════════════════════════════════
-       Blynk REST API polling
+       (Blynk API removed)
        ═══════════════════════════════════════════ */
-    async function fetchBlynk() {
-        if (!polling || !blynkIP || !blynkToken) return;
-        const base = `http://${blynkIP}:${blynkPort}/${blynkToken}`;
-        try {
-            // Read motor speed (V25 → slider, V23 → gauge mirror)
-            const resp = await fetch(`${base}/get/V25`, { signal: AbortSignal.timeout(2000) });
-            const val = await resp.json();
-            const speed = parseInt(val[0]) || 0;
-
-            blynkConnected = true;
-            updateConnectionBadge('badge-blynk', true);
-
-            document.getElementById('health-motor').textContent = speed;
-
-            // Update speed ring gauge
-            const maxSpeed = 100;
-            const pct = Math.min(speed / maxSpeed, 1);
-            const circumference = 2 * Math.PI * 42; // r=42
-            const offset = circumference * (1 - pct);
-            const ringFill = document.getElementById('speed-ring-fill');
-            ringFill.style.strokeDashoffset = offset;
-            ringFill.style.stroke = speed > 70 ? 'var(--accent-rose)' : speed > 40 ? 'var(--accent-amber)' : 'var(--accent-emerald)';
-            document.getElementById('speed-ring-value').textContent = speed;
-
-        } catch (e) {
-            blynkConnected = false;
-            updateConnectionBadge('badge-blynk', false);
-        }
-    }
 
     /* ═══════════════════════════════════════════
        Helpers
@@ -1425,9 +1419,7 @@
     function saveConfig() {
         const cfg = {
             camIP: document.getElementById('input-cam-ip').value,
-            blynkIP: document.getElementById('input-blynk-ip').value,
-            blynkPort: document.getElementById('input-blynk-port').value,
-            blynkToken: document.getElementById('input-blynk-token').value,
+            baseIP: document.getElementById('input-base-ip').value,
         };
         localStorage.setItem('glitch-dashboard-config', JSON.stringify(cfg));
     }
@@ -1437,9 +1429,7 @@
             const cfg = JSON.parse(localStorage.getItem('glitch-dashboard-config'));
             if (cfg) {
                 if (cfg.camIP) document.getElementById('input-cam-ip').value = cfg.camIP;
-                if (cfg.blynkIP) document.getElementById('input-blynk-ip').value = cfg.blynkIP;
-                if (cfg.blynkPort) document.getElementById('input-blynk-port').value = cfg.blynkPort;
-                if (cfg.blynkToken) document.getElementById('input-blynk-token').value = cfg.blynkToken;
+                if (cfg.baseIP) document.getElementById('input-base-ip').value = cfg.baseIP;
             }
         } catch(e) {}
     }
