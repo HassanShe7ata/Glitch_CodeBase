@@ -1,6 +1,3 @@
-#include <Arduino.h>
-void setServoAngle(int num, int ang);
-
 // =========================== ARM ESP32 CODE ===========================
 
 #include <Wire.h>
@@ -10,7 +7,7 @@ void setServoAngle(int num, int ang);
 #include <WiFi.h>
 
 // ================= WIFI =================
-char ssid[] = "GLITCH";
+char ssid[] = "hassan's-laptop-hotspot";
 char pass[] = "12345678";
 
 // ================= PCA9685 =================
@@ -83,10 +80,10 @@ const float L5 = 97.3;
 // ================================================================
 // CAMERA-TO-LINK4 TRANSFORM
 // ================================================================
-// Fixed extrinsics: camera frame → link4 end effector frame (given by calibration)
+// Fixed extrinsics: camera frame ΓåÆ link4 end effector frame (given by calibration)
 // Transforms a point P_cam in camera frame to P_l4 in link4 frame:
 //   [P_l4] = T_CAM_TO_L4 * [P_cam]
-// Axes mapping: x_cam→z_l4, y_cam→-y_l4, z_cam→x_l4
+// Axes mapping: x_camΓåÆz_l4, y_camΓåÆ-y_l4, z_camΓåÆx_l4
 // Translation: camera origin is at (-5.9, 6.35, 0) in link4 frame
 static const float T_CAM_TO_L4[4][4] = {
     { 0.0f,  0.0f,  1.0f,  -5.9f    },
@@ -299,7 +296,7 @@ static void forwardKinematics(float t1, float t2, float t3, float t4,
 }
 
 // ================================================================
-// CAMERA-FRAME → ARM-BASE-FRAME TRANSFORM
+// CAMERA-FRAME ΓåÆ ARM-BASE-FRAME TRANSFORM
 // ================================================================
 static void cameraToBase(float tx_cam, float ty_cam, float tz_cam,
                           float &x_base, float &y_base, float &z_base) {
@@ -393,7 +390,7 @@ void scanPose() {
 // CAMERA-GUIDED PICKUP
 // ================================================================
 // Called when camera pose data arrives via ESP-NOW.
-// Transforms QR from camera frame → arm base frame → IK → execute.
+// Transforms QR from camera frame ΓåÆ arm base frame ΓåÆ IK ΓåÆ execute.
 static void cameraGuidedPickup() {
   CameraPoseData *p = &incomingCameraPose;
 
@@ -407,7 +404,7 @@ static void cameraGuidedPickup() {
                 p->color, p->confidence,
                 p->tx_mm, p->ty_mm, p->tz_mm, p->yaw_deg);
 
-  // 1. Convert QR position from camera frame → arm base frame
+  // 1. Convert QR position from camera frame ΓåÆ arm base frame
   float x_qr, y_qr, z_qr;
   cameraToBase(p->tx_mm, p->ty_mm, p->tz_mm, x_qr, y_qr, z_qr);
 
@@ -581,7 +578,9 @@ void FromCarToRod() {
 // ESP NOW RECEIVE CALLBACK
 // ================================================================
 
-void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+void OnDataRecv(const esp_now_recv_info_t *recvInfo,
+                const uint8_t *incomingData,
+                int len) {
 
   // Camera pose data packet (larger than command string)
   if (len == sizeof(CameraPoseData)) {
@@ -646,15 +645,6 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   else if (strcmp(cmd, "FCTR") == 0) {
     FromCarToRod();
     Serial.print("FCTR");
-  }
-  else if (strncmp(cmd, "SV:", 3) == 0) {
-    int idx, angle;
-    if (sscanf(cmd, "SV:%d:%d", &idx, &angle) == 2) {
-      if (idx >= 0 && idx < NUM_SERVOS && angle >= 0 && angle <= 180) {
-        moveServo(idx, (float)angle);
-        Serial.printf("SV:%d:%d\n", idx, angle);
-      }
-    }
   }
   else
     Serial.println("[ERROR] Unknown Command");

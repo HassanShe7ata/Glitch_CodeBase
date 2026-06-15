@@ -1,16 +1,19 @@
-// =========================== BASE ESP32 CODE ===========================
-// WiFi AP + WebSocket controller — no laptop, no Blynk, no Flask.
-// Phone connects to "GLITCH" WiFi → opens http://192.168.4.1
+// =========================== BASE ESP32 (WiFi AP + WebSocket + ESP-NOW) ===========================
+// Phone → WiFi "GLITCH" → http://192.168.4.1 → WebSocket → ESP-NOW → Arm
+// Combines: old text/JSON WS protocol + camera + autonomous + telemetry
+//           new WiFi stability settings + cleanupClients + channel 11
 
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <esp_wifi.h>
 #include <math.h>
 #include <Wire.h>
 #include <esp_now.h>
 
 // ================= WIFI AP =================
 const char* AP_SSID = "GLITCH";
-const char* AP_PASS = "12345678";
+const char* AP_PASS = "Gl1tch2024!Secure";
+const uint8_t WIFI_CHANNEL = 11;
 
 // ================= WEB SERVER =================
 AsyncWebServer server(80);
@@ -69,6 +72,13 @@ struct __attribute__((packed)) CameraPoseData {
   float tz_mm;
   float yaw_deg;
   float confidence;
+};
+
+// ESP-NOW packet: Arm → Base (busy/idle status)
+struct __attribute__((packed)) ArmStatus {
+  uint8_t type;   // 0 = status
+  uint8_t busy;   // 1 = busy, 0 = idle
+  uint8_t pad[2];
 };
 
 // Latest camera pose data (updated by ESP-NOW callback)
@@ -138,7 +148,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     Serial.println("FAILED");
 }
 
-// ESP-NOW receive callback — handles pose replies from camera
+// ESP-NOW receive callback — handles pose replies from camera + status from arm
 void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (len == sizeof(PoseReply)) {
     memcpy((void *)&lastPoseReply, data, sizeof(PoseReply));
@@ -148,6 +158,12 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
         "[CAM] Pose: valid=%d color=%d conf=%.2f yaw=%.1f tz=%.1f est=%d\n",
         lastPoseReply.pose_valid, lastPoseReply.color, lastPoseReply.confidence,
         lastPoseReply.yaw_deg, lastPoseReply.tz_mm, lastPoseReply.estimated);
+  } else if (len == sizeof(ArmStatus)) {
+    ArmStatus st;
+    memcpy(&st, data, sizeof(st));
+    String json = "{\"type\":\"arm_status\",\"busy\":" + String(st.busy ? "true" : "false") + "}";
+    ws.textAll(json);
+    Serial.printf("[ARM] Status: busy=%d\n", st.busy);
   }
 }
 
@@ -194,7 +210,7 @@ void sendCameraPoseToArm() {
 }
 
 // ================================================================
-// HELPER FUNCTIONS
+// I2C HELPERS
 // ================================================================
 
 bool writeBytes(uint8_t reg, uint8_t *data, size_t len) {
@@ -230,11 +246,11 @@ bool writeSpeeds(int8_t v1, int8_t v2, int8_t v3, int8_t v4) {
 
 void manualMove(const int8_t vector[], int8_t speedVal) {
   for (int i = 0; i < 5; i++) {
-    if (writeSpeeds(vector[0] * speedVal, vector[1] * speedVal, 
+    if (writeSpeeds(vector[0] * speedVal, vector[1] * speedVal,
                     vector[2] * speedVal, vector[3] * speedVal)) {
       break;
     }
-    delay(5); // Wait 5ms before retrying if driver NACKs
+    delay(5);
   }
 }
 
@@ -243,8 +259,23 @@ void forceStop() {
     if (writeSpeeds(0, 0, 0, 0)) {
       break;
     }
-    delay(5); // Wait 5ms before retrying if driver NACKs
+    delay(5);
   }
+}
+
+// ================================================================
+// MECANUM WHEEL MIXING (for binary protocol compatibility)
+// ================================================================
+
+void computeMecanumSpeeds(int8_t throttle, int8_t steering, int8_t rotation, int8_t speeds[4]) {
+  int16_t fl =  (int16_t)throttle - (int16_t)steering + (int16_t)rotation;
+  int16_t fr = -(int16_t)throttle - (int16_t)steering + (int16_t)rotation;
+  int16_t bl = -(int16_t)throttle + (int16_t)steering + (int16_t)rotation;
+  int16_t br =  (int16_t)throttle + (int16_t)steering + (int16_t)rotation;
+  speeds[0] = (int8_t)constrain(fl, -100, 100);
+  speeds[1] = (int8_t)constrain(fr, -100, 100);
+  speeds[2] = (int8_t)constrain(bl, -100, 100);
+  speeds[3] = (int8_t)constrain(br, -100, 100);
 }
 
 // ================================================================
@@ -426,15 +457,33 @@ const char* colorName(uint8_t c) {
 }
 
 // ================================================================
-// WEBSOCKET COMMAND HANDLER
+// WEBSOCKET COMMAND HANDLER (text/JSON protocol)
 // ================================================================
+
+// Simple JSON string value extractor
+String jsonStr(const String &s, const String &key) {
+  String k = "\"" + key + "\"";
+  int p = s.indexOf(k);
+  if (p < 0) return "";
+  p = s.indexOf(':', p);
+  if (p < 0) return "";
+  p++;
+  while (p < (int)s.length() && s[p] == ' ') p++;
+  if (p >= (int)s.length()) return "";
+  if (s[p] == '"') {
+    int e = s.indexOf('"', p + 1);
+    return s.substring(p + 1, e);
+  }
+  int e = p;
+  while (e < (int)s.length() && s[e] != ',' && s[e] != '}' && s[e] != ' ') e++;
+  return s.substring(p, e);
+}
 
 void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
   AwsFrameInfo *info = (AwsFrameInfo *)arg;
   if (info->final && info->index == 0 && info->len == len &&
       info->opcode == WS_TEXT) {
 
-    // Safe copy to avoid buffer overrun crash (data may be read-only or exact-size)
     char buf[256];
     size_t copyLen = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
     memcpy(buf, data, copyLen);
@@ -442,7 +491,6 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
     String msg = buf;
     Serial.printf("[WS] Received: %s\n", msg.c_str());
 
-    // Minimal JSON parser — extract "cmd" and "arg"
     String cmd = jsonStr(msg, "cmd");
     String arg = jsonStr(msg, "arg");
 
@@ -489,9 +537,15 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
       } else if (arg == "CTP") {
         sendCommandToArm("CTP");
       } else {
-        // Direct arm command (BTC, RTC, GTC, RTF, BTF, GTF, etc.)
         sendCommandToArm(arg.c_str());
       }
+    } else if (cmd == "SSTEP") {
+      // arg = "J1,5" or "J3,-10" — single-step servo
+      int joint = arg.charAt(1) - '1'; // J1=0, J2=1, ...
+      int val = arg.substring(3).toInt();
+      char armCmd[10];
+      snprintf(armCmd, sizeof(armCmd), "SV:%d:%d", joint, val);
+      sendCommandToArm(armCmd);
     } else if (cmd == "AUTO") {
       if (arg == "TOGGLE") {
         autonomousMode = !autonomousMode;
@@ -514,32 +568,12 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
         Serial.println("[SCAN] Platform scan requested");
       }
     } else if (cmd == "SERVO") {
-      // arg format: "0:1" (idx:dir) or "0:UP"/"0:DOWN"
       int idx = arg.substring(0, arg.indexOf(':')).toInt();
       String dirStr = arg.substring(arg.indexOf(':') + 1);
       int dir = (dirStr == "UP" || dirStr == "1") ? 1 : -1;
       servoStep(idx, dir);
     }
   }
-}
-
-// Simple JSON string value extractor
-String jsonStr(const String &s, const String &key) {
-  String k = "\"" + key + "\"";
-  int p = s.indexOf(k);
-  if (p < 0) return "";
-  p = s.indexOf(':', p);
-  if (p < 0) return "";
-  p++;
-  while (p < (int)s.length() && s[p] == ' ') p++;
-  if (p >= (int)s.length()) return "";
-  if (s[p] == '"') {
-    int e = s.indexOf('"', p + 1);
-    return s.substring(p + 1, e);
-  }
-  int e = p;
-  while (e < (int)s.length() && s[e] != ',' && s[e] != '}' && s[e] != ' ') e++;
-  return s.substring(p, e);
 }
 
 // ================================================================
@@ -555,7 +589,6 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
       break;
     case WS_EVT_DISCONNECT:
       Serial.printf("[WS] Client #%u disconnected\n", client->id());
-      // Safety: stop motors when phone disconnects
       forceStop();
       break;
     case WS_EVT_DATA:
@@ -592,28 +625,294 @@ void sendTelemetry() {
 // CONTROLLER HTML (embedded)
 // ================================================================
 
-// Controller page embedded below as a raw string literal.
+const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Glitch — Robot Controller</title>
+    <meta name="theme-color" content="#0a0e17">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <style>
+        :root {
+            --bg: #0a0e17;
+            --panel: #111827;
+            --panel-2: #1f2937;
+            --border: rgba(99,102,241,0.25);
+            --text: #f1f5f9;
+            --muted: #94a3b8;
+            --accent: #818cf8;
+            --accent-glow: rgba(129,140,248,0.4);
+            --ok: #34d399;
+            --warn: #fbbf24;
+            --err: #fb7185;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+        html, body { background: var(--bg); color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            min-height: 100vh; }
+        body { padding: 14px; padding-bottom: env(safe-area-inset-bottom); max-width: 520px; margin: 0 auto; }
+        h1 { font-size: 22px; font-weight: 800; margin-bottom: 4px;
+            background: linear-gradient(135deg, #818cf8, #22d3ee);
+            -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; display:flex; align-items:center; gap:8px; }
+        .card { background: var(--panel); border: 1px solid var(--border);
+            border-radius: 14px; padding: 14px; margin-bottom: 12px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.25); }
+        .card h2 { font-size: 11px; color: var(--muted); font-weight: 600;
+            text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err);
+            transition: box-shadow 200ms; flex-shrink:0; }
+        .dot.ok { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+        .dot.warn { background: var(--warn); box-shadow: 0 0 10px var(--warn); }
+        button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+            border-radius: 10px; padding: 14px 8px; font-size: 14px; font-weight: 600;
+            cursor: pointer; user-select: none; -webkit-user-select: none;
+            transition: background 80ms, transform 80ms, box-shadow 200ms; touch-action: manipulation; }
+        button:active { background: var(--accent); transform: scale(0.96);
+            box-shadow: 0 0 16px var(--accent-glow); }
+        button.active { background: var(--accent); border-color: var(--accent);
+            box-shadow: 0 0 12px var(--accent-glow); }
+        button.danger:active { background: var(--err); }
+        .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; aspect-ratio: 1.4; }
+        .pad button { font-size: 26px; padding: 0; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+        .slider-row { display: flex; align-items: center; gap: 10px; }
+        .slider-row input[type="range"] { flex: 1; accent-color: var(--accent); height: 6px; }
+        .slider-row .val { font-family: 'Courier New', monospace; font-weight: 700;
+            min-width: 40px; text-align: right; font-size: 16px; }
+        .telemetry { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .tile { background: var(--panel-2); border-radius: 10px; padding: 10px; }
+        .tile .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+        .tile .val { font-family: 'Courier New', monospace; font-size: 20px; font-weight: 700; margin-top: 2px; }
+        .tile .val.small { font-size: 14px; }
+        .log { font-family: 'Courier New', monospace; font-size: 11px;
+            color: var(--muted); max-height: 130px; overflow-y: auto;
+            background: var(--panel-2); border-radius: 8px; padding: 8px; }
+        .log .err { color: var(--err); }
+        .log .ok  { color: var(--ok); }
+        .section-label { font-size: 10px; color: var(--muted); margin: 4px 0 6px; }
+        .step-btn { padding: 6px 14px !important; font-size: 16px !important; font-weight: 700 !important; }
+    </style>
+</head>
+<body>
+    <h1>Glitch</h1>
+    <div class="sub" id="connStatus"><span class="dot"></span><span>connecting…</span></div>
+
+    <div class="card">
+        <h2>Drive</h2>
+        <div class="pad">
+            <button id="btnDiagFL" data-cmd="MOVE" data-arg="DIAGFL">&#8598;</button>
+            <button id="btnFwd"    data-cmd="MOVE" data-arg="FWD">&#9650;</button>
+            <button id="btnDiagFR" data-cmd="MOVE" data-arg="DIAGFR">&#8599;</button>
+            <button id="btnLeft"   data-cmd="MOVE" data-arg="LEFT">&#9664;</button>
+            <button id="btnStop"   data-cmd="MOVE" data-arg="STOP" class="danger">&#9632;</button>
+            <button id="btnRight"  data-cmd="MOVE" data-arg="RIGHT">&#9654;</button>
+            <button id="btnDiagBL" data-cmd="MOVE" data-arg="DIAGBL">&#8601;</button>
+            <button id="btnBack"   data-cmd="MOVE" data-arg="BACK">&#9660;</button>
+            <button id="btnDiagBR" data-cmd="MOVE" data-arg="DIAGBR">&#8600;</button>
+        </div>
+        <div class="grid-2" style="margin-top:8px;">
+            <button id="btnRotCCW" data-cmd="MOVE" data-arg="ROTCCW">Rotate &#8634;</button>
+            <button id="btnRotCW"  data-cmd="MOVE" data-arg="ROTCW">Rotate &#8635;</button>
+        </div>
+        <div class="section-label" style="margin-top:14px">Motor Speed</div>
+        <div class="slider-row">
+            <input type="range" id="speed" min="0" max="80" value="25">
+            <span class="val" id="speedVal">25</span>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Arm Commands</h2>
+        <div class="grid-2">
+            <button data-cmd="ARM" data-arg="GTF">Green &rarr; Floor</button>
+            <button data-cmd="ARM" data-arg="BTC">Blue &rarr; Car</button>
+            <button data-cmd="ARM" data-arg="RTC">Red &rarr; Car</button>
+            <button data-cmd="ARM" data-arg="GTC">Green &rarr; Car</button>
+            <button data-cmd="ARM" data-arg="HOME" class="danger">Home</button>
+            <button data-cmd="ARM" data-arg="RTF">Red &rarr; Floor</button>
+            <button data-cmd="ARM" data-arg="BTF">Blue &rarr; Floor</button>
+            <button data-cmd="ARM" data-arg="CTP">Car &rarr; Platform</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Step Servo</h2>
+        <div style="display:grid;grid-template-columns:1fr auto auto;gap:6px 10px;align-items:center;font-size:13px;">
+            <span>S1 Base</span>     <button class="step-btn" data-joint="0" data-dir="-">-</button> <button class="step-btn" data-joint="0" data-dir="+">+</button>
+            <span>S2 Shoulder</span> <button class="step-btn" data-joint="1" data-dir="-">-</button> <button class="step-btn" data-joint="1" data-dir="+">+</button>
+            <span>S3 Elbow</span>    <button class="step-btn" data-joint="2" data-dir="-">-</button> <button class="step-btn" data-joint="2" data-dir="+">+</button>
+            <span>S4 Wrist</span>    <button class="step-btn" data-joint="3" data-dir="-">-</button> <button class="step-btn" data-joint="3" data-dir="+">+</button>
+            <span>S5 Claw</span>     <button class="step-btn" data-joint="4" data-dir="-">-</button> <button class="step-btn" data-joint="4" data-dir="+">+</button>
+        </div>
+        <div style="margin-top:8px;display:flex;align-items:center;gap:8px;">
+            <label style="font-size:10px;color:var(--muted);text-transform:uppercase;">Step °</label>
+            <input type="number" id="stepSize" value="5" min="1" max="90" style="width:50px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 6px;font-size:13px;text-align:center;">
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Mode</h2>
+        <div class="grid-2">
+            <button id="btnAuto" data-cmd="AUTO" data-arg="TOGGLE">Autonomous</button>
+            <button data-cmd="SCAN" data-arg="QR">Scan QR</button>
+            <button data-cmd="SCAN" data-arg="PLAT">Scan Platform</button>
+            <button data-cmd="ARM" data-arg="SCAN_POSE">Arm Scan Pose</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Event Log</h2>
+        <div class="log" id="log"></div>
+    </div>
+
+    <script>
+        const $ = (id) => document.getElementById(id);
+        const log = (msg, cls='') => {
+            const el = $('log');
+            const t = new Date().toLocaleTimeString();
+            el.innerHTML = '<div class="' + cls + '">[' + t + '] ' + msg + '</div>' + el.innerHTML;
+            while (el.children.length > 80) el.removeChild(el.lastChild);
+        };
+        const setStatus = (cls, text) => {
+            $('connStatus').innerHTML = '<span class="dot ' + cls + '"></span><span>' + text + '</span>';
+        };
+
+        // ── Arm busy state ─────────────────────────────────────────
+        let armBusy = false;
+        function setArmBusy(busy) {
+            armBusy = busy;
+            document.querySelectorAll('.step-btn').forEach(b => b.disabled = busy);
+            log(busy ? 'Arm: busy' : 'Arm: idle', busy ? 'err' : 'ok');
+        }
+
+        // ── Native WebSocket ───────────────────────────────────────
+        let ws = null;
+        let reconnectTimer = null;
+
+        function connect() {
+            const host = location.hostname || '192.168.4.1';
+            ws = new WebSocket('ws://' + host + '/ws');
+
+            ws.onopen = () => {
+                setStatus('ok', 'connected to base');
+                log('WebSocket connected', 'ok');
+                if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
+            };
+
+            ws.onclose = () => {
+                setStatus('', 'disconnected');
+                log('WebSocket disconnected', 'err');
+                if (!reconnectTimer) {
+                    reconnectTimer = setInterval(() => {
+                        log('Reconnecting...', '');
+                        connect();
+                    }, 3000);
+                }
+            };
+
+            ws.onerror = () => { ws.close(); };
+
+            ws.onmessage = (evt) => {
+                try {
+                    const s = JSON.parse(evt.data);
+                    if (s.type === 'arm_status') {
+                        setArmBusy(s.busy);
+                    }
+                } catch(e) {}
+            };
+        }
+
+        connect();
+
+        const send = (data) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(data));
+            }
+        };
+
+        // ── D-pad & Rotation: tap to move, tap STOP to stop ────────
+        const driveBtns = document.querySelectorAll('.pad button[data-cmd="MOVE"], #btnRotCCW, #btnRotCW');
+
+        const sendDriveCmd = function(e) {
+            e.preventDefault();
+            driveBtns.forEach(btn => btn.classList.remove('active'));
+            this.classList.add('active');
+            send({cmd:'MOVE', arg: this.dataset.arg});
+        };
+
+        driveBtns.forEach(b => {
+            b.addEventListener('touchstart', sendDriveCmd, { passive: false });
+            b.addEventListener('mousedown', sendDriveCmd);
+        });
+
+        // ── Single-shot buttons ────────────────────────────────────
+        document.querySelectorAll('button[data-cmd]').forEach(b => {
+            if (b.closest('.pad')) return;
+            b.addEventListener('click', () => send({cmd:b.dataset.cmd, arg:b.dataset.arg}));
+        });
+        $('btnAuto').addEventListener('click', () => $('btnAuto').classList.toggle('active'));
+
+        // ── Speed slider (debounced) ───────────────────────────────
+        let speedT;
+        $('speed').addEventListener('input', (e) => { $('speedVal').textContent = e.target.value; });
+        $('speed').addEventListener('input', (e) => {
+            clearTimeout(speedT);
+            speedT = setTimeout(() => send({cmd:'SPEED', arg: parseInt(e.target.value)}), 120);
+        });
+
+        // ── Step servo buttons ─────────────────────────────────────
+        const stepJoints = ['J1','J2','J3','J4','J5'];
+        document.querySelectorAll('.step-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (armBusy) return;
+                const j = parseInt(btn.dataset.joint);
+                const dir = btn.dataset.dir === '+' ? 1 : -1;
+                const deg = parseInt($('stepSize').value) || 5;
+                const val = dir * deg;
+                send({cmd:'SSTEP', arg: stepJoints[j] + ',' + val});
+            });
+        });
+
+        // ── Keyboard arrows for laptop use ─────────────────────────
+        const keyMap = { ArrowUp:'FWD', ArrowDown:'BACK', ArrowLeft:'LEFT', ArrowRight:'RIGHT' };
+        let keysDown = new Set();
+        document.addEventListener('keydown', e => {
+            if (keyMap[e.key] && !keysDown.has(e.key)) {
+                keysDown.add(e.key); send({cmd:'MOVE', arg: keyMap[e.key]});
+            }
+            if (e.key === ' ') { e.preventDefault(); send({cmd:'MOVE', arg:'STOP'}); }
+        });
+        document.addEventListener('keyup', e => {
+            if (keyMap[e.key]) { keysDown.delete(e.key); send({cmd:'MOVE', arg:'STOP'}); }
+        });
+    </script>
+</body>
+</html>
+)rawliteral";
 
 // ================================================================
 // SETUP
 // ================================================================
 
-extern const char CONTROLLER_HTML[];
-
 void setup() {
   Serial.begin(115200);
+
+  // I2C: 40 kHz (matches working Blynk config)
   Wire.begin(SDA_PIN, SCL_PIN, 40000);
-  Wire.setTimeOut(200); // Prevent I2C driver freeze on bad connection
+  Wire.setTimeOut(200);
   delay(500);
 
+  // Motor driver init (type=3, polarity=0 = normal 4-wheel mecanum)
   uint8_t motorType = 3;
   writeBytes(REG_MOTOR_TYPE, &motorType, 1);
   delay(10);
-
   uint8_t polarity = 0;
   writeBytes(REG_MOTOR_PHASE, &polarity, 1);
   delay(10);
-
   uint8_t resetData[16] = {0};
   writeBytes(REG_ENCODER_TOTAL, resetData, 16);
   forceStop();
@@ -621,8 +920,9 @@ void setup() {
 
   // ================= WIFI AP =================
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.softAP(AP_SSID, AP_PASS, WIFI_CHANNEL);
   delay(100);
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
   Serial.println("\n========================================");
   Serial.printf("  WiFi AP: %s\n", AP_SSID);
@@ -643,7 +943,7 @@ void setup() {
   // Add Arm peer
   esp_now_peer_info_t armPeer = {};
   memcpy(armPeer.peer_addr, armAddress, 6);
-  armPeer.channel = WiFi.channel();
+  armPeer.channel = WIFI_CHANNEL;
   armPeer.encrypt = false;
   armPeer.ifidx = WIFI_IF_AP;
 
@@ -656,7 +956,7 @@ void setup() {
   // Add Camera peer
   esp_now_peer_info_t camPeer = {};
   memcpy(camPeer.peer_addr, cameraAddress, 6);
-  camPeer.channel = WiFi.channel();
+  camPeer.channel = WIFI_CHANNEL;
   camPeer.encrypt = false;
   camPeer.ifidx = WIFI_IF_AP;
 
@@ -698,8 +998,8 @@ void loop() {
 
   // =================== STEP HANDLER ===================
   if (pendingStep) {
-    float stepDist = 50.0; // 50mm
-    float stepDeg = 15.0; // 15 degrees
+    float stepDist = 50.0;
+    float stepDeg = 15.0;
     if (stepArg == "FWD") {
       moveDistanceKp(V_FORWARD, Motor_speed, stepDist, TICKS_FWD_BWD);
     } else if (stepArg == "BACK") {
@@ -789,266 +1089,3 @@ void loop() {
     Serial.println("[AUTO] Autonomous pickup complete");
   }
 }
-
-// ================================================================
-// EMBEDDED CONTROLLER HTML
-// ================================================================
-// This is the full controller.html embedded as a raw string literal.
-// It uses native WebSocket (no CDN/internet dependency).
-
-const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Glitch — Robot Controller</title>
-    <meta name="theme-color" content="#0a0e17">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <style>
-        :root {
-            --bg: #0a0e17;
-            --panel: #111827;
-            --panel-2: #1f2937;
-            --border: rgba(99,102,241,0.25);
-            --text: #f1f5f9;
-            --muted: #94a3b8;
-            --accent: #818cf8;
-            --accent-glow: rgba(129,140,248,0.4);
-            --ok: #34d399;
-            --warn: #fbbf24;
-            --err: #fb7185;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-        html, body { background: var(--bg); color: var(--text);
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-            min-height: 100vh; }
-        body { padding: 14px; padding-bottom: env(safe-area-inset-bottom); max-width: 520px; margin: 0 auto; }
-        h1 { font-size: 22px; font-weight: 800; margin-bottom: 4px;
-            background: linear-gradient(135deg, #818cf8, #22d3ee);
-            -webkit-background-clip: text; background-clip: text; color: transparent; }
-        .sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; display:flex; align-items:center; gap:8px; }
-        .card { background: var(--panel); border: 1px solid var(--border);
-            border-radius: 14px; padding: 14px; margin-bottom: 12px;
-            box-shadow: 0 4px 16px rgba(0,0,0,0.25); }
-        .card h2 { font-size: 11px; color: var(--muted); font-weight: 600;
-            text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
-        .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err);
-            transition: box-shadow 200ms; flex-shrink:0; }
-        .dot.ok { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
-        .dot.warn { background: var(--warn); box-shadow: 0 0 10px var(--warn); }
-        button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
-            border-radius: 10px; padding: 14px 8px; font-size: 14px; font-weight: 600;
-            cursor: pointer; user-select: none; -webkit-user-select: none;
-            transition: background 80ms, transform 80ms, box-shadow 200ms; touch-action: manipulation; }
-        button:active { background: var(--accent); transform: scale(0.96);
-            box-shadow: 0 0 16px var(--accent-glow); }
-        button.active { background: var(--accent); border-color: var(--accent);
-            box-shadow: 0 0 12px var(--accent-glow); }
-        button.danger:active { background: var(--err); }
-        .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; aspect-ratio: 1.4; }
-        .pad button { font-size: 26px; padding: 0; }
-        .pad .empty { visibility: hidden; }
-        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-        .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
-        .slider-row { display: flex; align-items: center; gap: 10px; }
-        .slider-row input[type="range"] { flex: 1; accent-color: var(--accent); height: 6px; }
-        .slider-row .val { font-family: 'Courier New', monospace; font-weight: 700;
-            min-width: 40px; text-align: right; font-size: 16px; }
-        .telemetry { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-        .tile { background: var(--panel-2); border-radius: 10px; padding: 10px; }
-        .tile .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
-        .tile .val { font-family: 'Courier New', monospace; font-size: 20px; font-weight: 700; margin-top: 2px; }
-        .tile .val.small { font-size: 14px; }
-        .log { font-family: 'Courier New', monospace; font-size: 11px;
-            color: var(--muted); max-height: 130px; overflow-y: auto;
-            background: var(--panel-2); border-radius: 8px; padding: 8px; }
-        .log .err { color: var(--err); }
-        .log .ok  { color: var(--ok); }
-        .section-label { font-size: 10px; color: var(--muted); margin: 4px 0 6px; }
-    </style>
-</head>
-<body>
-    <h1>Glitch</h1>
-    <div class="sub" id="connStatus"><span class="dot"></span><span>connecting…</span></div>
-
-    <div class="card">
-        <h2>Drive</h2>
-        <div class="pad">
-            <button id="btnDiagFL" data-cmd="MOVE" data-arg="DIAGFL">&#8598;</button>
-            <button id="btnFwd"    data-cmd="MOVE" data-arg="FWD">&#9650;</button>
-            <button id="btnDiagFR" data-cmd="MOVE" data-arg="DIAGFR">&#8599;</button>
-            <button id="btnLeft"   data-cmd="MOVE" data-arg="LEFT">&#9664;</button>
-            <button id="btnStop"   data-cmd="MOVE" data-arg="STOP" class="danger">&#9632;</button>
-            <button id="btnRight"  data-cmd="MOVE" data-arg="RIGHT">&#9654;</button>
-            <button id="btnDiagBL" data-cmd="MOVE" data-arg="DIAGBL">&#8601;</button>
-            <button id="btnBack"   data-cmd="MOVE" data-arg="BACK">&#9660;</button>
-            <button id="btnDiagBR" data-cmd="MOVE" data-arg="DIAGBR">&#8600;</button>
-        </div>
-        <div class="grid-2" style="margin-top:8px;">
-            <button id="btnRotCCW" data-cmd="MOVE" data-arg="ROTCCW">Rotate &#8634;</button>
-            <button id="btnRotCW"  data-cmd="MOVE" data-arg="ROTCW">Rotate &#8635;</button>
-        </div>
-        <div class="section-label" style="margin-top:14px">Motor Speed</div>
-        <div class="slider-row">
-            <input type="range" id="speed" min="0" max="80" value="25">
-            <span class="val" id="speedVal">25</span>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>Arm Commands</h2>
-        <div class="grid-2">
-            <button data-cmd="ARM" data-arg="GTF">Green &rarr; Floor</button>
-            <button data-cmd="ARM" data-arg="BTC">Blue &rarr; Car</button>
-            <button data-cmd="ARM" data-arg="RTC">Red &rarr; Car</button>
-            <button data-cmd="ARM" data-arg="GTC">Green &rarr; Car</button>
-            <button data-cmd="ARM" data-arg="HOME" class="danger">Home</button>
-            <button data-cmd="ARM" data-arg="RTF">Red &rarr; Floor</button>
-            <button data-cmd="ARM" data-arg="BTF">Blue &rarr; Floor</button>
-            <button data-cmd="ARM" data-arg="CTP">Car &rarr; Platform</button>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>Mode</h2>
-        <div class="grid-2">
-            <button id="btnAuto" data-cmd="AUTO" data-arg="TOGGLE">Autonomous</button>
-            <button data-cmd="SCAN" data-arg="QR">Scan QR</button>
-            <button data-cmd="SCAN" data-arg="PLAT">Scan Platform</button>
-            <button data-cmd="ARM" data-arg="SCAN_POSE">Arm Scan Pose</button>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>Live Telemetry</h2>
-        <div class="telemetry">
-            <div class="tile"><div class="label">Confidence</div><div class="val" id="tConf">&mdash;</div></div>
-            <div class="tile"><div class="label">Yaw &deg;</div><div class="val" id="tYaw">&mdash;</div></div>
-            <div class="tile"><div class="label">Color</div><div class="val" id="tColor">&mdash;</div></div>
-            <div class="tile"><div class="label">Distance mm</div><div class="val" id="tDist">&mdash;</div></div>
-            <div class="tile"><div class="label">Motor Speed</div><div class="val" id="tSpeed">&mdash;</div></div>
-            <div class="tile"><div class="label">Heap / State</div><div class="val small" id="tHeap">&mdash;</div></div>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>Event Log</h2>
-        <div class="log" id="log"></div>
-    </div>
-
-    <script>
-        const $ = (id) => document.getElementById(id);
-        const log = (msg, cls='') => {
-            const el = $('log');
-            const t = new Date().toLocaleTimeString();
-            el.innerHTML = '<div class="' + cls + '">[' + t + '] ' + msg + '</div>' + el.innerHTML;
-            while (el.children.length > 80) el.removeChild(el.lastChild);
-        };
-        const setStatus = (cls, text) => {
-            $('connStatus').innerHTML = '<span class="dot ' + cls + '"></span><span>' + text + '</span>';
-        };
-
-        // ── Native WebSocket to Base ESP32 ─────────────────────────
-        let ws = null;
-        let reconnectTimer = null;
-
-        function connect() {
-            const host = location.hostname || '192.168.4.1';
-            ws = new WebSocket('ws://' + host + '/ws');
-
-            ws.onopen = () => {
-                setStatus('ok', 'connected to base');
-                log('WebSocket connected', 'ok');
-                if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
-            };
-
-            ws.onclose = () => {
-                setStatus('', 'disconnected');
-                log('WebSocket disconnected', 'err');
-                if (!reconnectTimer) {
-                    reconnectTimer = setInterval(() => {
-                        log('Reconnecting...', '');
-                        connect();
-                    }, 3000);
-                }
-            };
-
-            ws.onerror = () => {
-                ws.close();
-            };
-
-            ws.onmessage = (evt) => {
-                try {
-                    const s = JSON.parse(evt.data);
-                    if (s.type === 'telemetry') {
-                        $('tConf').textContent  = (s.confidence*100).toFixed(0) + '%';
-                        $('tYaw').textContent   = parseFloat(s.yaw).toFixed(1);
-                        $('tColor').textContent = s.color;
-                        $('tDist').textContent  = parseInt(s.distance_mm);
-                        $('tSpeed').textContent = s.motor_speed;
-                        $('tHeap').textContent  = (s.free_heap/1024).toFixed(0) + 'kB / ' + (s.autonomous ? 'AUTO' : 'MANUAL');
-                    }
-                } catch(e) {}
-            };
-        }
-
-        connect();
-
-        const send = (data) => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(data));
-            }
-        };
-
-        // ── D-pad & Rotation: Tap once to go, tap STOP to stop ─────────
-        const driveBtns = document.querySelectorAll('.pad button[data-cmd="MOVE"], #btnRotCCW, #btnRotCW');
-        
-        const sendDriveCmd = function(e) {
-            e.preventDefault();
-            
-            // Highlight the currently active mode
-            driveBtns.forEach(btn => btn.classList.remove('active'));
-            this.classList.add('active');
-            
-            send({cmd:'MOVE', arg: this.dataset.arg});
-        };
-
-        driveBtns.forEach(b => {
-            b.addEventListener('touchstart', sendDriveCmd, { passive: false });
-            b.addEventListener('mousedown', sendDriveCmd);
-        });
-
-        // ── Single-shot buttons ────────────────────────────────────
-        document.querySelectorAll('button[data-cmd]').forEach(b => {
-            if (b.closest('.pad')) return;
-            b.addEventListener('click', () => send({cmd:b.dataset.cmd, arg:b.dataset.arg}));
-        });
-        $('btnAuto').addEventListener('click', () => $('btnAuto').classList.toggle('active'));
-
-        // ── Speed slider (debounced) ───────────────────────────────
-        let speedT;
-        $('speed').addEventListener('input', (e) => { $('speedVal').textContent = e.target.value; });
-        $('speed').addEventListener('input', (e) => {
-            clearTimeout(speedT);
-            speedT = setTimeout(() => send({cmd:'SPEED', arg: parseInt(e.target.value)}), 120);
-        });
-
-        // ── Keyboard arrows for laptop use ─────────────────────────
-        const keyMap = { ArrowUp:'FWD', ArrowDown:'BACK', ArrowLeft:'LEFT', ArrowRight:'RIGHT' };
-        let keysDown = new Set();
-        document.addEventListener('keydown', e => {
-            if (keyMap[e.key] && !keysDown.has(e.key)) {
-                keysDown.add(e.key); send({cmd:'MOVE', arg: keyMap[e.key]});
-            }
-            if (e.key === ' ') { e.preventDefault(); send({cmd:'MOVE', arg:'STOP'}); }
-        });
-        document.addEventListener('keyup', e => {
-            if (keyMap[e.key]) { keysDown.delete(e.key); send({cmd:'MOVE', arg:'STOP'}); }
-        });
-    </script>
-</body>
-</html>
-)rawliteral";
-
-
