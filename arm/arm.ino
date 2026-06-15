@@ -422,6 +422,16 @@ void RedToCar() {
   goHome();
 }
 
+// ================= CAR TO PLATFORM (manual pickup) =================
+// Approach sequence: moves to posRod with gripper open.
+// User then manually adjusts with step buttons and grips.
+void CarToPlatform() {
+  Serial.println("[ACTION] Car To Platform — approach");
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0);
+  moveRobot(posRod[0], posRod[1], posRod[2],       posRod[3], 0);
+  Serial.println("[ACTION] At car — use step buttons to adjust, then grip");
+}
+
 // ================= DISPATCH (called from loop, NEVER from callback) =================
 static void sendArmStatus(bool busy) {
   ArmStatus st = {};
@@ -437,6 +447,7 @@ static void dispatchCmd(const char* cmd) {
   else if (strcmp(cmd, "GTF") == 0)  GreenToFloor();
   else if (strcmp(cmd, "BTF") == 0)  BlueToFloor();
   else if (strcmp(cmd, "RTF") == 0)  RedToFloor();
+  else if (strcmp(cmd, "CTP") == 0)  CarToPlatform();
   else if (strcmp(cmd, "H")   == 0)  goHome();
   else if (strcmp(cmd, "S")   == 0)  scanPose();
   else if (strncmp(cmd, "SV:", 3) == 0) {
