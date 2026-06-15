@@ -153,9 +153,13 @@ JointAngles calculateIK(float x, float y, float z, float phi_deg) {
 }
 
 // ================= MOVE ROBOT =================
-void moveRobot(float x, float y, float z, float pitch, int gripState) {
+// Returns true if IK was reachable and move executed, false if unreachable.
+bool moveRobot(float x, float y, float z, float pitch, int gripState) {
   JointAngles ik = calculateIK(x, y, z, pitch);
-  if (!ik.reachable) return;
+  if (!ik.reachable) {
+    Serial.printf("[ARM] IK unreachable: (%.0f,%.0f,%.0f) phi=%.0f\n", x, y, z, pitch);
+    return false;
+  }
   targetAngles[0] = ik.t1;
   targetAngles[1] = ik.t2;
   targetAngles[2] = ik.t3;
@@ -163,6 +167,7 @@ void moveRobot(float x, float y, float z, float pitch, int gripState) {
   if (gripState != 9)
     targetAngles[4] = (gripState == 1) ? GRIP_CLOSE : GRIP_OPEN;
   executeSyncMove();
+  return true;
 }
 
 void goHome()   { moveRobot(0, 90, 150, -20, 0); }
@@ -258,17 +263,29 @@ static void cameraGuidedPickup() {
                 x_qr, y_qr, z_qr);
 
   // 2. Approach: move 40mm above QR with gripper open
-  moveRobot(x_qr, y_qr, z_qr + 40, -90, 0);
+  if (!moveRobot(x_qr, y_qr, z_qr + 40, -90, 0)) {
+    Serial.println("[CAM] ABORT: approach above QR unreachable");
+    goHome();
+    return;
+  }
 
   // 3. Descend to QR
-  moveRobot(x_qr, y_qr, z_qr, -90, 0);
+  if (!moveRobot(x_qr, y_qr, z_qr, -90, 0)) {
+    Serial.println("[CAM] ABORT: descend to QR unreachable");
+    goHome();
+    return;
+  }
 
   // 4. Close gripper
   moveRobot(x_qr, y_qr, z_qr, -90, 1);
   delay(200);
 
   // 5. Lift QR
-  moveRobot(x_qr, y_qr, z_qr + 40, -90, 1);
+  if (!moveRobot(x_qr, y_qr, z_qr + 40, -90, 1)) {
+    Serial.println("[CAM] ABORT: lift unreachable");
+    goHome();
+    return;
+  }
 
   // 6. Go home with object
   goHome();
