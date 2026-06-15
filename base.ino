@@ -41,18 +41,26 @@ struct_message armMessage;
 // =================== CAMERA ESP-NOW ===================
 static uint8_t cameraAddress[] = {0x94, 0xA9, 0x90, 0x08, 0xB2, 0xB8};
 
+// ESP-NOW packet types (must match camera firmware)
+enum EspNowPacketType : uint8_t {
+  ESPNOW_TYPE_SCAN_REQ   = 0x20,
+  ESPNOW_TYPE_POSE_REPLY = 0x30,
+};
+
 // ESP-NOW packet: Base → Camera (scan request)
 struct __attribute__((packed)) ScanRequest {
+  uint8_t type;        // ESPNOW_TYPE_SCAN_REQ (0x20)
   uint8_t task_id;
-  uint8_t mode; // 0=scan_qr, 1=scan_platform
-  uint8_t reserved[2];
+  uint8_t mode;        // 0=scan_qr, 1=scan_platform
+  uint8_t reserved;
 };
 
 // ESP-NOW packet: Camera → Base (pose reply)
 struct __attribute__((packed)) PoseReply {
+  uint8_t type;        // ESPNOW_TYPE_POSE_REPLY (0x30)
   uint8_t task_id;
   uint8_t pose_valid;
-  uint8_t color; // 0=unknown, 1=R, 2=G, 3=B
+  uint8_t color;       // 0=unknown, 1=R, 2=G, 3=B
   uint8_t estimated;
   float tx_mm;
   float ty_mm;
@@ -150,7 +158,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
 // ESP-NOW receive callback — handles pose replies from camera + status from arm
 void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
-  if (len == sizeof(PoseReply)) {
+  if (len == sizeof(PoseReply) && data[0] == ESPNOW_TYPE_POSE_REPLY) {
     memcpy((void *)&lastPoseReply, data, sizeof(PoseReply));
     cameraPoseReceived = true;
 
@@ -182,6 +190,7 @@ void sendCommandToArm(const char *cmd) {
 void sendScanRequest(uint8_t mode) {
   ScanRequest req = {};
   static uint8_t taskCounter = 0;
+  req.type = ESPNOW_TYPE_SCAN_REQ;
   req.task_id = ++taskCounter;
   req.mode = mode;
   esp_err_t result = esp_now_send(cameraAddress, (uint8_t *)&req, sizeof(req));
@@ -764,6 +773,16 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         </div>
     </div>
 
+    <div class="card" id="camCard" style="display:none;">
+        <h2>Camera</h2>
+        <div class="telemetry">
+            <div class="tile"><div class="label">Color</div><div class="val" id="camColor">--</div></div>
+            <div class="tile"><div class="label">Confidence</div><div class="val" id="camConf">--</div></div>
+            <div class="tile"><div class="label">Distance</div><div class="val" id="camDist">--</div></div>
+            <div class="tile"><div class="label">Yaw</div><div class="val" id="camYaw">--</div></div>
+        </div>
+    </div>
+
     <div class="card">
         <h2>Event Log</h2>
         <div class="log" id="log"></div>
@@ -821,6 +840,14 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
                     const s = JSON.parse(evt.data);
                     if (s.type === 'arm_status') {
                         setArmBusy(s.busy);
+                    } else if (s.type === 'telemetry') {
+                        if (s.color && s.color !== 'NONE') {
+                            $('camCard').style.display = '';
+                            $('camColor').textContent = s.color;
+                            $('camConf').textContent = s.confidence != null ? s.confidence.toFixed(2) : '--';
+                            $('camDist').textContent = s.distance_mm != null ? s.distance_mm + 'mm' : '--';
+                            $('camYaw').textContent = s.yaw != null ? s.yaw.toFixed(1) + '\u00B0' : '--';
+                        }
                     }
                 } catch(e) {}
             };

@@ -61,6 +61,22 @@ typedef struct __attribute__((packed)) {
   uint8_t pad[2];
 } ArmStatus;
 
+// Camera pose data forwarded by base via ESP-NOW
+struct __attribute__((packed)) CameraPoseData {
+  uint8_t type;        // 1 = camera pose packet
+  uint8_t pose_valid;
+  uint8_t color;       // 0=unknown, 1=R, 2=G, 3=B
+  uint8_t estimated;
+  float tx_mm;
+  float ty_mm;
+  float tz_mm;
+  float yaw_deg;
+  float confidence;
+};
+
+static volatile bool cameraPoseReady = false;
+static CameraPoseData incomingCameraPose;
+
 // ================= BASE MAC =================
 uint8_t baseAddress[6] = {0x80, 0xF3, 0xDA, 0x42, 0x3E, 0x5C};
 
@@ -151,6 +167,125 @@ void moveRobot(float x, float y, float z, float pitch, int gripState) {
 
 void goHome()   { moveRobot(0, 90, 150, -20, 0); }
 void scanPose() { moveRobot(0, 150, 200, -45, 0); }
+
+// ================= CAMERA-TO-LINK4 TRANSFORM =================
+// Fixed extrinsics: camera frame -> link4 end effector frame
+static const float T_CAM_TO_L4[4][4] = {
+    { 0.0f,  0.0f,  1.0f,  -5.9f    },
+    { 0.0f, -1.0f,  0.0f,   6.35f   },
+    { 1.0f,  0.0f,  0.0f,   0.0f    },
+    { 0.0f,  0.0f,  0.0f,   1.0f    }
+};
+
+// ================= FORWARD KINEMATICS =================
+// Given joint angles t1..t4, compute link4 end effector pose (x,y,z,phi) in arm base frame.
+static void forwardKinematics(float t1, float t2, float t3, float t4,
+                               float &x, float &y, float &z, float &phi_deg) {
+  float d1  = atan2f(L3, L2);
+  float t1r = t1 * PI / 180.0f;
+  float t2r = t2 * PI / 180.0f;
+  float t3r = t3 * PI / 180.0f;
+  float t4r = t4 * PI / 180.0f;
+
+  float q2 = t2r - d1;
+  float q3 = t3r - d1;
+
+  float phi = q2 - q3 + (PI/2.0f - t4r);
+
+  float R_up = sqrtf(L2*L2 + L3*L3);
+
+  float R_elbow = R_up * cosf(q2);
+  float Z_elbow = L1 + R_up * sinf(q2);
+
+  float R_wrist = R_elbow + L4 * cosf(q2 - q3);
+  float Z_wrist = Z_elbow + L4 * sinf(q2 - q3);
+
+  float R_ee = R_wrist + L5 * cosf(phi);
+  float Z_ee = Z_wrist + L5 * sinf(phi);
+
+  x = R_ee * cosf(t1r);
+  y = R_ee * sinf(t1r);
+  z = Z_ee;
+  phi_deg = phi * 180.0f / PI;
+}
+
+// ================= CAMERA-FRAME -> ARM-BASE-FRAME =================
+static void cameraToBase(float tx_cam, float ty_cam, float tz_cam,
+                          float &x_base, float &y_base, float &z_base) {
+  float l4x, l4y, l4z, l4phi;
+  forwardKinematics(currentAngle[0], currentAngle[1],
+                    currentAngle[2], currentAngle[3],
+                    l4x, l4y, l4z, l4phi);
+
+  float dx = T_CAM_TO_L4[0][0]*tx_cam + T_CAM_TO_L4[0][1]*ty_cam +
+             T_CAM_TO_L4[0][2]*tz_cam + T_CAM_TO_L4[0][3];
+  float dy = T_CAM_TO_L4[1][0]*tx_cam + T_CAM_TO_L4[1][1]*ty_cam +
+             T_CAM_TO_L4[1][2]*tz_cam + T_CAM_TO_L4[1][3];
+  float dz = T_CAM_TO_L4[2][0]*tx_cam + T_CAM_TO_L4[2][1]*ty_cam +
+             T_CAM_TO_L4[2][2]*tz_cam + T_CAM_TO_L4[2][3];
+
+  float t1r = currentAngle[0] * PI / 180.0f;
+  x_base = l4x + dx*cosf(t1r) - dy*sinf(t1r);
+  y_base = l4y + dx*sinf(t1r) + dy*cosf(t1r);
+  z_base = l4z + dz;
+}
+
+// Forward declarations for color-based place functions
+void GreenToCar();
+void BlueToCar();
+void RedToCar();
+
+// ================= CAMERA-GUIDED PICKUP =================
+// Called from loop() when camera pose data arrives via ESP-NOW.
+// Transforms QR from camera frame -> arm base frame -> IK -> grip -> color place.
+static void cameraGuidedPickup() {
+  CameraPoseData *p = &incomingCameraPose;
+
+  if (!p->pose_valid) {
+    Serial.println("[CAM] Ignoring invalid pose");
+    return;
+  }
+
+  Serial.printf("[CAM] Guided pickup: color=%d conf=%.2f "
+                "qr=(%.0f,%.0f,%.0f) yaw=%.1f\n",
+                p->color, p->confidence,
+                p->tx_mm, p->ty_mm, p->tz_mm, p->yaw_deg);
+
+  // 1. Convert QR position from camera frame -> arm base frame
+  float x_qr, y_qr, z_qr;
+  cameraToBase(p->tx_mm, p->ty_mm, p->tz_mm, x_qr, y_qr, z_qr);
+  Serial.printf("[CAM] QR in base frame: (%.0f, %.0f, %.0f)\n",
+                x_qr, y_qr, z_qr);
+
+  // 2. Approach: move 40mm above QR with gripper open
+  moveRobot(x_qr, y_qr, z_qr + 40, -90, 0);
+
+  // 3. Descend to QR
+  moveRobot(x_qr, y_qr, z_qr, -90, 0);
+
+  // 4. Close gripper
+  moveRobot(x_qr, y_qr, z_qr, -90, 1);
+  delay(200);
+
+  // 5. Lift QR
+  moveRobot(x_qr, y_qr, z_qr + 40, -90, 1);
+
+  // 6. Go home with object
+  goHome();
+
+  // 7. Place based on color
+  switch (p->color) {
+    case 1: Serial.println("[CAM] -> RedToCar"); RedToCar();   break;
+    case 2: Serial.println("[CAM] -> GreenToCar"); GreenToCar(); break;
+    case 3: Serial.println("[CAM] -> BlueToCar"); BlueToCar();  break;
+    default:
+      Serial.printf("[CAM] Unknown color %d, going home\n", p->color);
+      goHome();
+      break;
+  }
+
+  Serial.println("[CAM] Camera-guided pickup complete");
+}
 
 // ================= EXECUTE SYNC MOVE =================
 // Blocking but yields every 10 ms via delay().  During the yield, the ESP-NOW
@@ -317,11 +452,27 @@ static void dispatchCmd(const char* cmd) {
 void OnDataRecv(const uint8_t *mac_addr,
                 const uint8_t *incomingData,
                 int len) {
+  // Camera pose packet (24 bytes, type=1)
+  if (len == sizeof(CameraPoseData)) {
+    CameraPoseData pose;
+    memcpy(&pose, incomingData, sizeof(pose));
+    if (pose.type == 1 && pose.pose_valid) {
+      memcpy((void *)&incomingCameraPose, &pose, sizeof(pose));
+      cameraPoseReady = true;
+      Serial.printf("[ARM] Camera pose received: color=%d conf=%.2f "
+                    "qr=(%.0f,%.0f,%.0f)\n",
+                    pose.color, pose.confidence,
+                    pose.tx_mm, pose.ty_mm, pose.tz_mm);
+    }
+    return;
+  }
+
+  // Arm command (10 bytes)
   if (len != sizeof(ArmCommand)) return;
 
   ArmCommand msg;
   memcpy(&msg, incomingData, sizeof(msg));
-  msg.command[9] = '\0';   // defend against non-null-terminated sender
+  msg.command[9] = '\0';
 
   if (!enqueueCmd(msg.command))
     Serial.println("[ARM] Queue full — drop");
@@ -436,6 +587,14 @@ void loop() {
     dispatchCmd(cmd);
   }
   if (didWork) {
+    sendArmStatus(false);
+  }
+
+  // Handle camera-guided pickup (blocks but yields via executeSyncMove)
+  if (cameraPoseReady) {
+    cameraPoseReady = false;
+    sendArmStatus(true);
+    cameraGuidedPickup();
     sendArmStatus(false);
   }
 
