@@ -1,10 +1,8 @@
-// =========================== BASE ESP32 (WiFi AP + WebSocket + ESP-NOW) ===========================
-// Phone → WiFi "GLITCH" → http://192.168.4.1 → WebSocket → ESP-NOW → Arm
-// Combines: old text/JSON WS protocol + camera + autonomous + telemetry
-//           new WiFi stability settings + cleanupClients + channel 11
+// =========================== BASE ESP32 (WiFi AP + HTTP + ESP-NOW) ===========================
+// Phone → WiFi "GLITCH" → http://192.168.4.1 → HTTP POST → ESP-NOW → Arm/Camera
 
 #include <WiFi.h>
-#include <ESPAsyncWebServer.h>
+#include <WebServer.h>
 #include <esp_wifi.h>
 #include <math.h>
 #include <Wire.h>
@@ -16,8 +14,7 @@ const char* AP_PASS = "Gl1tch2024!Secure";
 const uint8_t WIFI_CHANNEL = 11;
 
 // ================= WEB SERVER =================
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
+WebServer server(80);
 
 // ================= ESP-NOW SHARED ENUMS =================
 enum ArmColorCode : uint8_t {
@@ -39,7 +36,7 @@ typedef struct struct_message {
 struct_message armMessage;
 
 // =================== CAMERA ESP-NOW ===================
-static uint8_t cameraAddress[] = {0x94, 0xA9, 0x90, 0x08, 0xB2, 0xB8};
+static uint8_t cameraAddress[] = {0x94, 0xA9, 0x90, 0x08, 0xB2, 0xB8}; // must match camera's WiFi STA MAC
 
 // ESP-NOW packet types (must match camera firmware)
 enum EspNowPacketType : uint8_t {
@@ -92,6 +89,23 @@ struct __attribute__((packed)) ArmStatus {
 // Latest camera pose data (updated by ESP-NOW callback)
 static volatile bool cameraPoseReceived = false;
 static volatile PoseReply lastPoseReply;
+
+// Latest arm status (updated by ESP-NOW callback)
+static volatile bool armStatusReceived = false;
+static volatile ArmStatus lastArmStatus;
+
+// ESP-NOW recv debug counter
+static volatile uint32_t espNowRecvCount = 0;
+static volatile uint32_t espNowRecvBytes = 0;
+static volatile uint32_t espNowRecvMatchPose = 0;
+static volatile uint32_t espNowRecvMatchArm = 0;
+static volatile uint32_t espNowRecvNoMatch = 0;
+
+// Last QR scan result (persists until new scan)
+static bool lastQrValid = false;
+static uint8_t lastQrColor = 0;
+static float lastQrTx = 0, lastQrTy = 0, lastQrTz = 0, lastQrYaw = 0, lastQrConf = 0;
+static bool newQrResult = false;
 
 // --- STEP MOVEMENT FLAG ---
 bool pendingStep = false;
@@ -156,38 +170,25 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     Serial.println("FAILED");
 }
 
-// ESP-NOW receive callback — handles pose replies from camera + status from arm
+// ESP-NOW receive callback — JUST STORE DATA, no heavy operations
 void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
-  if (len == sizeof(PoseReply) && data[0] == ESPNOW_TYPE_POSE_REPLY) {
+  if (!mac || !data || len < 1) return;
+  bool fromArm = (memcmp(mac, armAddress, 6) == 0);
+  bool fromCam = (memcmp(mac, cameraAddress, 6) == 0);
+  if (!fromArm && !fromCam) return;
+
+  espNowRecvCount++;
+  espNowRecvBytes += len;
+  if (fromCam && len == (int)sizeof(PoseReply) && data[0] == ESPNOW_TYPE_POSE_REPLY) {
     memcpy((void *)&lastPoseReply, data, sizeof(PoseReply));
     cameraPoseReceived = true;
-
-    Serial.printf(
-        "[CAM] Pose: valid=%d color=%d conf=%.2f yaw=%.1f tz=%.1f est=%d\n",
-        lastPoseReply.pose_valid, lastPoseReply.color, lastPoseReply.confidence,
-        lastPoseReply.yaw_deg, lastPoseReply.tz_mm, lastPoseReply.estimated);
-
-    // Send QR result to GUI immediately (skip platform detection color=0xFF)
-    if (ws.count() > 0 && lastPoseReply.color != 0xFF) {
-      String json = "{\"type\":\"qr_result\"";
-      json += ",\"pose_valid\":" + String(lastPoseReply.pose_valid);
-      json += ",\"color\":" + String(lastPoseReply.color);
-      json += ",\"color_name\":\"" + String(colorName(lastPoseReply.color)) + "\"";
-      json += ",\"confidence\":" + String(lastPoseReply.confidence, 2);
-      json += ",\"tx_mm\":" + String(lastPoseReply.tx_mm, 0);
-      json += ",\"ty_mm\":" + String(lastPoseReply.ty_mm, 0);
-      json += ",\"tz_mm\":" + String(lastPoseReply.tz_mm, 0);
-      json += ",\"yaw_deg\":" + String(lastPoseReply.yaw_deg, 1);
-      json += ",\"estimated\":" + String(lastPoseReply.estimated);
-      json += "}";
-      ws.textAll(json);
-    }
-  } else if (len == sizeof(ArmStatus)) {
-    ArmStatus st;
-    memcpy(&st, data, sizeof(st));
-    String json = "{\"type\":\"arm_status\",\"busy\":" + String(st.busy ? "true" : "false") + "}";
-    ws.textAll(json);
-    Serial.printf("[ARM] Status: busy=%d\n", st.busy);
+    espNowRecvMatchPose++;
+  } else if (fromArm && len == (int)sizeof(ArmStatus) && data[0] == 0) {
+    memcpy((void *)&lastArmStatus, data, sizeof(ArmStatus));
+    armStatusReceived = true;
+    espNowRecvMatchArm++;
+  } else {
+    espNowRecvNoMatch++;
   }
 }
 
@@ -504,56 +505,47 @@ String jsonStr(const String &s, const String &key) {
   return s.substring(p, e);
 }
 
-void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
-  AwsFrameInfo *info = (AwsFrameInfo *)arg;
-  if (info->final && info->index == 0 && info->len == len &&
-      info->opcode == WS_TEXT) {
+void handleCommand(const String &msg) {
+  Serial.printf("[CMD] Received: %s\n", msg.c_str());
 
-    char buf[256];
-    size_t copyLen = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
-    memcpy(buf, data, copyLen);
-    buf[copyLen] = 0;
-    String msg = buf;
-    Serial.printf("[WS] Received: %s\n", msg.c_str());
+  String cmd = jsonStr(msg, "cmd");
+  String arg = jsonStr(msg, "arg");
 
-    String cmd = jsonStr(msg, "cmd");
-    String arg = jsonStr(msg, "arg");
-
-    if (cmd == "MOVE") {
-      if (!autonomousMode) {
-        if (arg == "STOP") {
-          forceStop();
-          return;
-        }
-        if (arg == "FWD")
-          manualMove(V_FORWARD, Motor_speed);
-        else if (arg == "BACK")
-          manualMove(V_BACKWARD, Motor_speed);
-        else if (arg == "LEFT")
-          manualMove(V_STRAFE_L, Motor_speed);
-        else if (arg == "RIGHT")
-          manualMove(V_STRAFE_R, Motor_speed);
-        else if (arg == "ROTCW")
-          manualMove(V_ROTATE_CW, Motor_speed);
-        else if (arg == "ROTCCW")
-          manualMove(V_ROTATE_CCW, Motor_speed);
-        else if (arg == "DIAGFR")
-          manualMove(V_DIAG_FR, Motor_speed);
-        else if (arg == "DIAGFL")
-          manualMove(V_DIAG_FL, Motor_speed);
-        else if (arg == "DIAGBR")
-          manualMove(V_DIAG_BR, Motor_speed);
-        else if (arg == "DIAGBL")
-          manualMove(V_DIAG_BL, Motor_speed);
+  if (cmd == "MOVE") {
+    if (!autonomousMode) {
+      if (arg == "STOP") {
+        forceStop();
+        return;
       }
-    } else if (cmd == "STEP") {
-      if (!autonomousMode && !pendingStep) {
-        pendingStep = true;
-        stepArg = arg;
-      }
-    } else if (cmd == "SPEED") {
-      Motor_speed = (int8_t)constrain(arg.toInt(), 0, 100);
-      Serial.printf("Motor Speed Updated: %d\n", Motor_speed);
+      if (arg == "FWD")
+        manualMove(V_FORWARD, Motor_speed);
+      else if (arg == "BACK")
+        manualMove(V_BACKWARD, Motor_speed);
+      else if (arg == "LEFT")
+        manualMove(V_STRAFE_L, Motor_speed);
+      else if (arg == "RIGHT")
+        manualMove(V_STRAFE_R, Motor_speed);
+      else if (arg == "ROTCW")
+        manualMove(V_ROTATE_CW, Motor_speed);
+      else if (arg == "ROTCCW")
+        manualMove(V_ROTATE_CCW, Motor_speed);
+      else if (arg == "DIAGFR")
+        manualMove(V_DIAG_FR, Motor_speed);
+      else if (arg == "DIAGFL")
+        manualMove(V_DIAG_FL, Motor_speed);
+      else if (arg == "DIAGBR")
+        manualMove(V_DIAG_BR, Motor_speed);
+      else if (arg == "DIAGBL")
+        manualMove(V_DIAG_BL, Motor_speed);
+    }
+  } else if (cmd == "STEP") {
+    if (!autonomousMode && !pendingStep) {
+      pendingStep = true;
+      stepArg = arg;
+    }
+  } else if (cmd == "SPEED") {
+    Motor_speed = (int8_t)constrain(arg.toInt(), 0, 100);
+    Serial.printf("Motor Speed Updated: %d\n", Motor_speed);
     } else if (cmd == "ARM") {
       if (arg == "HOME") {
         sendCommandToArm("H");
@@ -562,98 +554,56 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
       } else if (arg == "CTP") {
         sendCommandToArm("CTP");
       } else if (arg == "CAM_PICKUP") {
-        if (cameraPoseReceived && lastPoseReply.pose_valid) {
+        if (lastQrValid) {
           sendCameraPoseToArm();
+          newQrResult = false;
           Serial.println("[CAM] Pose forwarded to arm for IK pickup");
         } else {
           Serial.println("[CAM] No valid pose to send");
         }
-      } else {
-        sendCommandToArm(arg.c_str());
-      }
-    } else if (cmd == "SSTEP") {
-      // arg = "J1,5" or "J3,-10" — single-step servo
-      int joint = arg.charAt(1) - '1'; // J1=0, J2=1, ...
-      int val = arg.substring(3).toInt();
-      char armCmd[10];
-      snprintf(armCmd, sizeof(armCmd), "SV:%d:%d", joint, val);
-      sendCommandToArm(armCmd);
-    } else if (cmd == "AUTO") {
-      if (arg == "TOGGLE") {
-        autonomousMode = !autonomousMode;
-      } else {
-        autonomousMode = (arg == "ON");
-      }
-      if (autonomousMode) {
-        autoTrigger = 1;
-        Serial.println("AUTONOMOUS MODE");
-      } else {
-        Serial.println("MANUAL MODE");
-      }
-      forceStop();
+    } else {
+      sendCommandToArm(arg.c_str());
+    }
+  } else if (cmd == "SSTEP") {
+    int joint = arg.charAt(1) - '1';
+    int val = arg.substring(3).toInt();
+    char armCmd[10];
+    snprintf(armCmd, sizeof(armCmd), "SV:%d:%d", joint, val);
+    sendCommandToArm(armCmd);
+  } else if (cmd == "AUTO") {
+    if (arg == "TOGGLE") {
+      autonomousMode = !autonomousMode;
+    } else {
+      autonomousMode = (arg == "ON");
+    }
+    if (autonomousMode) {
+      autoTrigger = 1;
+      Serial.println("AUTONOMOUS MODE");
+    } else {
+      Serial.println("MANUAL MODE");
+    }
+    forceStop();
     } else if (cmd == "SCAN") {
       if (arg == "QR") {
+        newQrResult = false;
         sendScanRequest(0);
         Serial.println("[SCAN] QR scan requested");
       } else if (arg == "PLAT") {
+        newQrResult = false;
         sendScanRequest(1);
         Serial.println("[SCAN] Platform scan requested");
       }
-    } else if (cmd == "SERVO") {
-      int idx = arg.substring(0, arg.indexOf(':')).toInt();
-      String dirStr = arg.substring(arg.indexOf(':') + 1);
-      int dir = (dirStr == "UP" || dirStr == "1") ? 1 : -1;
-      servoStep(idx, dir);
-    }
+  } else if (cmd == "SERVO") {
+    int idx = arg.substring(0, arg.indexOf(':')).toInt();
+    String dirStr = arg.substring(arg.indexOf(':') + 1);
+    int dir = (dirStr == "UP" || dirStr == "1") ? 1 : -1;
+    servoStep(idx, dir);
   }
 }
 
 // ================================================================
 // WEBSOCKET EVENT HANDLER
 // ================================================================
-
-void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
-               AwsEventType type, void *arg, uint8_t *data, size_t len) {
-  switch (type) {
-    case WS_EVT_CONNECT:
-      Serial.printf("[WS] Client #%u connected from %s\n", client->id(),
-                     client->remoteIP().toString().c_str());
-      break;
-    case WS_EVT_DISCONNECT:
-      Serial.printf("[WS] Client #%u disconnected\n", client->id());
-      forceStop();
-      break;
-    case WS_EVT_DATA:
-      handleWebSocketMessage(arg, data, len);
-      break;
-    case WS_EVT_PONG:
-    case WS_EVT_ERROR:
-      break;
-  }
-}
-
-// ================================================================
-// TELEMETRY PUSH
-// ================================================================
-
-void sendTelemetry() {
-  if (ws.count() == 0) return;
-
-  String json = "{\"type\":\"telemetry\"";
-  json += ",\"confidence\":" + String(lastPoseReply.confidence, 2);
-  json += ",\"yaw\":" + String(lastPoseReply.yaw_deg, 1);
-  json += ",\"color\":\"" + String(colorName(lastPoseReply.color)) + "\"";
-  json += ",\"distance_mm\":" + String(lastPoseReply.tz_mm, 0);
-  json += ",\"tx_mm\":" + String(lastPoseReply.tx_mm, 0);
-  json += ",\"ty_mm\":" + String(lastPoseReply.ty_mm, 0);
-  json += ",\"motor_speed\":" + String(Motor_speed);
-  json += ",\"free_heap\":" + String(ESP.getFreeHeap());
-  json += ",\"autonomous\":" + String(autonomousMode ? "true" : "false");
-  json += ",\"connected\":true";
-  json += "}";
-
-  ws.textAll(json);
-}
 
 // ================================================================
 // CONTROLLER HTML (embedded)
@@ -793,15 +743,12 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         <div class="grid-2">
             <button id="btnAuto" data-cmd="AUTO" data-arg="TOGGLE">Autonomous</button>
             <button data-cmd="SCAN" data-arg="QR">Scan QR</button>
-            <button data-cmd="SCAN" data-arg="PLAT">Scan Platform</button>
-            <button data-cmd="ARM" data-arg="SCAN_POSE">Arm Scan Pose</button>
         </div>
     </div>
 
     <div class="card" id="camCard">
         <h2>Camera</h2>
         <div class="grid-2" style="margin-bottom:10px;">
-            <button id="btnScanQR" data-cmd="SCAN" data-arg="QR">Scan &amp; Decode QR</button>
             <button id="btnPerformIK" disabled>Perform IK Pickup</button>
         </div>
         <div class="telemetry">
@@ -820,225 +767,125 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
     </div>
 
     <script>
-        const $ = (id) => document.getElementById(id);
-        const log = (msg, cls='') => {
-            const el = $('log');
-            const t = new Date().toLocaleTimeString();
-            el.innerHTML = '<div class="' + cls + '">[' + t + '] ' + msg + '</div>' + el.innerHTML;
-            while (el.children.length > 80) el.removeChild(el.lastChild);
+        var $=function(id){return document.getElementById(id)};
+        var log=function(msg,cls){
+            var el=$('log');var t=new Date().toLocaleTimeString();
+            el.innerHTML='<div class="'+cls+'">['+t+'] '+msg+'</div>'+el.innerHTML;
+            while(el.children.length>80)el.removeChild(el.lastChild);
         };
-        const setStatus = (cls, text) => {
-            $('connStatus').innerHTML = '<span class="dot ' + cls + '"></span><span>' + text + '</span>';
+        var setStatus=function(cls,text){
+            $('connStatus').innerHTML='<span class="dot '+cls+'"></span><span>'+text+'</span>';
         };
+        var armBusy=false;
+        function setArmBusy(busy){
+            armBusy=busy;
+            document.querySelectorAll('.step-btn').forEach(function(b){b.disabled=busy});
+            $('btnPerformIK').disabled=busy||!lastPose.valid;
+            log(busy?'Arm: busy':'Arm: idle',busy?'err':'ok');
+        }
+        var lastPose={valid:false,color:0,tx:0,ty:0,tz:0,yaw:0,conf:0,msg:''};
+        var scanMiss=0;
 
-        // ── Arm busy state ─────────────────────────────────────────
-        let armBusy = false;
-        function setArmBusy(busy) {
-            armBusy = busy;
-            document.querySelectorAll('.step-btn').forEach(b => b.disabled = busy);
-            $('btnPerformIK').disabled = busy || !lastPose.valid;
-            log(busy ? 'Arm: busy' : 'Arm: idle', busy ? 'err' : 'ok');
+        function send(data){
+            fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+            .catch(function(){});
         }
 
-        // ── Last camera pose (for Perform IK button) ──────────────
-        let lastPose = { valid: false, color: 0, tx: 0, ty: 0, tz: 0, yaw: 0, conf: 0, msg: '' };
-
-        // ── Native WebSocket ───────────────────────────────────────
-        let ws = null;
-        let reconnectTimer = null;
-
-        function connect() {
-            const host = location.hostname || '192.168.4.1';
-            ws = new WebSocket('ws://' + host + '/ws');
-
-            ws.onopen = () => {
-                setStatus('ok', 'connected to base');
-                log('WebSocket connected', 'ok');
-                if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
-            };
-
-            ws.onclose = () => {
-                setStatus('', 'disconnected');
-                log('WebSocket disconnected', 'err');
-                if (!reconnectTimer) {
-                    reconnectTimer = setInterval(() => {
-                        log('Reconnecting...', '');
-                        connect();
-                    }, 3000);
+        function pollStatus(){
+            fetch('/status').then(function(r){return r.json()}).then(function(s){
+                setStatus('ok','connected to base');
+                setArmBusy(s.arm_busy);
+                if(s.color&&s.color!=='NONE'){
+                    $('camCard').style.display='';
+                    $('camColor').textContent=s.color;
+                    $('camConf').textContent=s.confidence!=null?(parseFloat(s.confidence)).toFixed(2):'--';
+                    $('camDist').textContent=s.distance_mm!=null?s.distance_mm+'mm':'--';
+                    $('camYaw').textContent=s.yaw!=null?parseFloat(s.yaw).toFixed(1)+'\u00B0':'--';
+                    $('camPose').textContent=(s.tx_mm!=null?s.tx_mm:'--')+', '+(s.ty_mm!=null?s.ty_mm:'--')+', '+(s.distance_mm!=null?s.distance_mm:'--');
                 }
-            };
-
-            ws.onerror = () => { ws.close(); };
-
-            ws.onmessage = (evt) => {
-                try {
-                    const s = JSON.parse(evt.data);
-                    if (s.type === 'arm_status') {
-                        setArmBusy(s.busy);
-                    } else if (s.type === 'telemetry') {
-                        if (s.color && s.color !== 'NONE') {
-                            $('camColor').textContent = s.color;
-                            $('camConf').textContent = s.confidence != null ? s.confidence.toFixed(2) : '--';
-                            $('camDist').textContent = s.distance_mm != null ? s.distance_mm + 'mm' : '--';
-                            $('camYaw').textContent = s.yaw != null ? s.yaw.toFixed(1) + '\u00B0' : '--';
-                            $('camPose').textContent = (s.tx_mm != null ? s.tx_mm : '--') + ', ' + (s.ty_mm != null ? s.ty_mm : '--') + ', ' + (s.distance_mm != null ? s.distance_mm : '--');
-                            if (s.qr_msg) $('camMsg').textContent = s.qr_msg;
-                        }
-                    } else if (s.type === 'qr_result') {
-                        lastPose.valid = s.pose_valid;
-                        lastPose.color = s.color;
-                        lastPose.tx = s.tx_mm;
-                        lastPose.ty = s.ty_mm;
-                        lastPose.tz = s.tz_mm;
-                        lastPose.yaw = s.yaw_deg;
-                        lastPose.conf = s.confidence;
-                        lastPose.msg = s.qr_msg || '';
-                        $('camMsg').textContent = s.qr_msg || '(no text)';
-                        $('camColor').textContent = s.color_name || '--';
-                        $('camConf').textContent = s.confidence != null ? s.confidence.toFixed(2) : '--';
-                        $('camDist').textContent = s.tz_mm != null ? s.tz_mm.toFixed(0) + 'mm' : '--';
-                        $('camYaw').textContent = s.yaw_deg != null ? s.yaw_deg.toFixed(1) + '\u00B0' : '--';
-                        $('camPose').textContent = (s.tx_mm != null ? s.tx_mm.toFixed(0) : '--') + ', ' + (s.ty_mm != null ? s.ty_mm.toFixed(0) : '--') + ', ' + (s.tz_mm != null ? s.tz_mm.toFixed(0) : '--');
-                        $('btnPerformIK').disabled = !s.pose_valid || armBusy;
-                        log('QR decoded: ' + (s.qr_msg || '(no text)') + ' color=' + (s.color_name || '?'), s.pose_valid ? 'ok' : 'err');
-                    }
-                } catch(e) {}
-            };
-        }
-
-        connect();
-
-        const send = (data) => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(data));
-            }
-        };
-        const setStatus = (cls, text) => {
-            $('connStatus').innerHTML = '<span class="dot ' + cls + '"></span><span>' + text + '</span>';
-        };
-
-        // ── Arm busy state ─────────────────────────────────────────
-        let armBusy = false;
-        function setArmBusy(busy) {
-            armBusy = busy;
-            document.querySelectorAll('.step-btn').forEach(b => b.disabled = busy);
-            log(busy ? 'Arm: busy' : 'Arm: idle', busy ? 'err' : 'ok');
-        }
-
-        // ── Native WebSocket ───────────────────────────────────────
-        let ws = null;
-        let reconnectTimer = null;
-
-        function connect() {
-            const host = location.hostname || '192.168.4.1';
-            ws = new WebSocket('ws://' + host + '/ws');
-
-            ws.onopen = () => {
-                setStatus('ok', 'connected to base');
-                log('WebSocket connected', 'ok');
-                if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
-            };
-
-            ws.onclose = () => {
-                setStatus('', 'disconnected');
-                log('WebSocket disconnected', 'err');
-                if (!reconnectTimer) {
-                    reconnectTimer = setInterval(() => {
-                        log('Reconnecting...', '');
-                        connect();
-                    }, 3000);
+                if(s.qr_result){
+                    var qr=s.qr_result;
+                    lastPose.valid=qr.pose_valid;
+                    lastPose.color=qr.color;
+                    lastPose.tx=qr.tx_mm;
+                    lastPose.ty=qr.ty_mm;
+                    lastPose.tz=qr.tz_mm;
+                    lastPose.yaw=qr.yaw_deg;
+                    lastPose.conf=qr.confidence;
+                    lastPose.msg=qr.qr_msg||'';
+                    $('camMsg').textContent=qr.qr_msg||'(no text)';
+                    $('camColor').textContent=qr.color_name||'--';
+                    $('camConf').textContent=qr.confidence!=null?(parseFloat(qr.confidence)).toFixed(2):'--';
+                    $('camDist').textContent=qr.tz_mm!=null?parseFloat(qr.tz_mm).toFixed(0)+'mm':'--';
+                    $('camYaw').textContent=qr.yaw_deg!=null?parseFloat(qr.yaw_deg).toFixed(1)+'\u00B0':'--';
+                    $('camPose').textContent=(qr.tx_mm!=null?parseFloat(qr.tx_mm).toFixed(0):'--')+', '+(qr.ty_mm!=null?parseFloat(qr.ty_mm).toFixed(0):'--')+', '+(qr.tz_mm!=null?parseFloat(qr.tz_mm).toFixed(0):'--');
+                    $('btnPerformIK').disabled=!qr.pose_valid||armBusy;
+                    if(qr.pose_valid)log('QR decoded: '+(qr.qr_msg||'(no text)')+' color='+(qr.color_name||'?'),'ok');
+                    scanMiss=0;
+                }else if(!s.qr_pending){
+                }else{
+                    scanMiss++;
+                    if(scanMiss>1)$('camMsg').textContent='No QR found (#'+scanMiss+')';
                 }
-            };
-
-            ws.onerror = () => { ws.close(); };
-
-            ws.onmessage = (evt) => {
-                try {
-                    const s = JSON.parse(evt.data);
-                    if (s.type === 'arm_status') {
-                        setArmBusy(s.busy);
-                    } else if (s.type === 'telemetry') {
-                        if (s.color && s.color !== 'NONE') {
-                            $('camCard').style.display = '';
-                            $('camColor').textContent = s.color;
-                            $('camConf').textContent = s.confidence != null ? s.confidence.toFixed(2) : '--';
-                            $('camDist').textContent = s.distance_mm != null ? s.distance_mm + 'mm' : '--';
-                            $('camYaw').textContent = s.yaw != null ? s.yaw.toFixed(1) + '\u00B0' : '--';
-                        }
-                    }
-                } catch(e) {}
-            };
+            }).catch(function(){
+                setStatus('','disconnected');
+            });
         }
+        setInterval(pollStatus,500);
+        pollStatus();
 
-        connect();
-
-        const send = (data) => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(data));
-            }
-        };
-
-        // ── D-pad & Rotation: tap to move, tap STOP to stop ────────
-        const driveBtns = document.querySelectorAll('.pad button[data-cmd="MOVE"], #btnRotCCW, #btnRotCW');
-
-        const sendDriveCmd = function(e) {
+        var driveBtns=document.querySelectorAll('.pad button[data-cmd="MOVE"], #btnRotCCW, #btnRotCW');
+        var sendDriveCmd=function(e){
             e.preventDefault();
-            driveBtns.forEach(btn => btn.classList.remove('active'));
+            driveBtns.forEach(function(btn){btn.classList.remove('active')});
             this.classList.add('active');
-            send({cmd:'MOVE', arg: this.dataset.arg});
+            send({cmd:'MOVE',arg:this.dataset.arg});
         };
-
-        driveBtns.forEach(b => {
-            b.addEventListener('touchstart', sendDriveCmd, { passive: false });
-            b.addEventListener('mousedown', sendDriveCmd);
+        driveBtns.forEach(function(b){
+            b.addEventListener('touchstart',sendDriveCmd,{passive:false});
+            b.addEventListener('mousedown',sendDriveCmd);
         });
 
-        // ── Single-shot buttons ────────────────────────────────────
-        document.querySelectorAll('button[data-cmd]').forEach(b => {
-            if (b.closest('.pad')) return;
-            b.addEventListener('click', () => send({cmd:b.dataset.cmd, arg:b.dataset.arg}));
+        document.querySelectorAll('button[data-cmd]').forEach(function(b){
+            if(b.closest('.pad'))return;
+            b.addEventListener('click',function(){send({cmd:b.dataset.cmd,arg:b.dataset.arg})});
         });
-        $('btnAuto').addEventListener('click', () => $('btnAuto').classList.toggle('active'));
+        $('btnAuto').addEventListener('click',function(){$('btnAuto').classList.toggle('active')});
 
-        // ── Perform IK button ──────────────────────────────────────
-        $('btnPerformIK').addEventListener('click', () => {
-            if (!lastPose.valid || armBusy) return;
-            send({cmd:'ARM', arg:'CAM_PICKUP'});
-            log('Sending IK pickup: color=' + lastPose.color + ' pose=(' + lastPose.tx + ',' + lastPose.ty + ',' + lastPose.tz + ')', '');
+        $('btnPerformIK').addEventListener('click',function(){
+            if(!lastPose.valid||armBusy)return;
+            send({cmd:'ARM',arg:'CAM_PICKUP'});
+            log('Sending IK pickup: color='+lastPose.color+' pose=('+lastPose.tx+','+lastPose.ty+','+lastPose.tz+')','');
         });
 
-        // ── Speed slider (debounced) ───────────────────────────────
-        let speedT;
-        $('speed').addEventListener('input', (e) => { $('speedVal').textContent = e.target.value; });
-        $('speed').addEventListener('input', (e) => {
+        var speedT;
+        $('speed').addEventListener('input',function(e){$('speedVal').textContent=e.target.value});
+        $('speed').addEventListener('input',function(e){
             clearTimeout(speedT);
-            speedT = setTimeout(() => send({cmd:'SPEED', arg: parseInt(e.target.value)}), 120);
+            speedT=setTimeout(function(){send({cmd:'SPEED',arg:parseInt(e.target.value)})},120);
         });
 
-        // ── Step servo buttons ─────────────────────────────────────
-        const stepJoints = ['J1','J2','J3','J4','J5'];
-        document.querySelectorAll('.step-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                if (armBusy) return;
-                const j = parseInt(btn.dataset.joint);
-                const dir = btn.dataset.dir === '+' ? 1 : -1;
-                const deg = parseInt($('stepSize').value) || 5;
-                const val = dir * deg;
-                send({cmd:'SSTEP', arg: stepJoints[j] + ',' + val});
+        var stepJoints=['J1','J2','J3','J4','J5'];
+        document.querySelectorAll('.step-btn').forEach(function(btn){
+            btn.addEventListener('click',function(){
+                if(armBusy)return;
+                var j=parseInt(btn.dataset.joint);
+                var dir=btn.dataset.dir==='+'?1:-1;
+                var deg=parseInt($('stepSize').value)||5;
+                send({cmd:'SSTEP',arg:stepJoints[j]+','+(dir*deg)});
             });
         });
 
-        // ── Keyboard arrows for laptop use ─────────────────────────
-        const keyMap = { ArrowUp:'FWD', ArrowDown:'BACK', ArrowLeft:'LEFT', ArrowRight:'RIGHT' };
-        let keysDown = new Set();
-        document.addEventListener('keydown', e => {
-            if (keyMap[e.key] && !keysDown.has(e.key)) {
-                keysDown.add(e.key); send({cmd:'MOVE', arg: keyMap[e.key]});
+        var keyMap={ArrowUp:'FWD',ArrowDown:'BACK',ArrowLeft:'LEFT',ArrowRight:'RIGHT'};
+        var keysDown=new Set();
+        document.addEventListener('keydown',function(e){
+            if(keyMap[e.key]&&!keysDown.has(e.key)){
+                keysDown.add(e.key);send({cmd:'MOVE',arg:keyMap[e.key]});
             }
-            if (e.key === ' ') { e.preventDefault(); send({cmd:'MOVE', arg:'STOP'}); }
+            if(e.key===' '){e.preventDefault();send({cmd:'MOVE',arg:'STOP'});}
         });
-        document.addEventListener('keyup', e => {
-            if (keyMap[e.key]) { keysDown.delete(e.key); send({cmd:'MOVE', arg:'STOP'}); }
+        document.addEventListener('keyup',function(e){
+            if(keyMap[e.key]){keysDown.delete(e.key);send({cmd:'MOVE',arg:'STOP'});}
         });
     </script>
 </body>
@@ -1070,7 +917,6 @@ void setup() {
   Serial.println("Motor System Ready");
 
   // ================= WIFI AP =================
-  WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS, WIFI_CHANNEL);
   delay(100);
   esp_wifi_set_ps(WIFI_PS_NONE);
@@ -1078,7 +924,7 @@ void setup() {
   Serial.println("\n========================================");
   Serial.printf("  WiFi AP: %s\n", AP_SSID);
   Serial.printf("  IP: %s\n", WiFi.softAPIP().toString().c_str());
-  Serial.printf("  BASE MAC: %s\n", WiFi.macAddress().c_str());
+  Serial.printf("  BASE MAC: %s\n", WiFi.softAPmacAddress().c_str());
   Serial.printf("  Channel: %d\n", WiFi.channel());
   Serial.println("========================================");
 
@@ -1120,18 +966,43 @@ void setup() {
   Serial.println("ESP-NOW READY");
 
   // ================= WEB SERVER =================
-  ws.onEvent(onWsEvent);
-  server.addHandler(&ws);
 
   // Serve controller page at root
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/html", CONTROLLER_HTML);
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", CONTROLLER_HTML);
   });
 
-  // Health check endpoint
-  server.on("/healthz", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String json = "{\"ok\":true,\"clients\":" + String(ws.count()) + "}";
-    request->send(200, "application/json", json);
+  // Status endpoint — polled by GUI every 500ms
+  server.on("/status", HTTP_GET, []() {
+    String json = "{";
+    json += "\"arm_busy\":" + String(lastArmStatus.busy ? "true" : "false");
+    json += ",\"autonomous\":" + String(autonomousMode ? "true" : "false");
+    json += ",\"qr_pending\":" + String(newQrResult ? "false" : "true");
+
+    if (newQrResult) {
+      json += ",\"qr_result\":{";
+      json += "\"pose_valid\":" + String(lastQrValid);
+      json += ",\"color\":" + String(lastQrColor);
+      json += ",\"color_name\":\"" + String(colorName(lastQrColor)) + "\"";
+      json += ",\"confidence\":" + String(lastQrConf, 2);
+      json += ",\"tx_mm\":" + String(lastQrTx, 0);
+      json += ",\"ty_mm\":" + String(lastQrTy, 0);
+      json += ",\"tz_mm\":" + String(lastQrTz, 0);
+      json += ",\"yaw_deg\":" + String(lastQrYaw, 1);
+      json += ",\"qr_msg\":\"QR Color " + String(colorName(lastQrColor)) + "\"";
+      json += "}";
+    }
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  // Command endpoint — GUI POSTs commands here
+  server.on("/cmd", HTTP_POST, []() {
+    String body = server.arg("plain");
+    if (body.length() > 0) {
+      handleCommand(body);
+    }
+    server.send(200, "application/json", "{\"ok\":true}");
   });
 
   server.begin();
@@ -1145,7 +1016,34 @@ void setup() {
 // ================================================================
 
 void loop() {
-  ws.cleanupClients();
+  server.handleClient();
+
+  // =================== DEFERRED ESP-NOW DATA ===================
+  if (cameraPoseReceived) {
+    cameraPoseReceived = false;
+    PoseReply reply;
+    memcpy(&reply, (const void *)&lastPoseReply, sizeof(reply));
+    Serial.printf(
+        "[CAM] Pose: valid=%d color=%d conf=%.2f yaw=%.1f tz=%.1f est=%d\n",
+        reply.pose_valid, reply.color, reply.confidence,
+        reply.yaw_deg, reply.tz_mm, reply.estimated);
+    if (reply.color != 0xFF) {
+      lastQrValid = reply.pose_valid;
+      lastQrColor = reply.color;
+      lastQrTx = reply.tx_mm;
+      lastQrTy = reply.ty_mm;
+      lastQrTz = reply.tz_mm;
+      lastQrYaw = reply.yaw_deg;
+      lastQrConf = reply.confidence;
+      newQrResult = true;
+    }
+  }
+  if (armStatusReceived) {
+    armStatusReceived = false;
+    ArmStatus st;
+    memcpy(&st, (const void *)&lastArmStatus, sizeof(st));
+    Serial.printf("[ARM] Status: busy=%d\n", st.busy);
+  }
 
   // =================== STEP HANDLER ===================
   if (pendingStep) {
@@ -1175,11 +1073,14 @@ void loop() {
     pendingStep = false;
   }
 
-  // =================== TELEMETRY PUSH ===================
-  static unsigned long lastTelemetry = 0;
-  if (millis() - lastTelemetry > 2000) {
-    lastTelemetry = millis();
-    sendTelemetry();
+  // =================== ESP-NOW DEBUG ===================
+  static unsigned long lastStatusUpdate = 0;
+  if (millis() - lastStatusUpdate > 5000) {
+    lastStatusUpdate = millis();
+    Serial.printf("[ESP-NOW RX] total=%lu bytes=%lu pose=%lu arm=%lu nomatch=%lu\n",
+      (unsigned long)espNowRecvCount, (unsigned long)espNowRecvBytes,
+      (unsigned long)espNowRecvMatchPose, (unsigned long)espNowRecvMatchArm,
+      (unsigned long)espNowRecvNoMatch);
   }
 
   // =================== AUTONOMOUS MODE ===================
@@ -1217,7 +1118,7 @@ void loop() {
 
         unsigned long t0 = millis();
         while (millis() - t0 < 12000) {
-          ws.cleanupClients();
+          server.handleClient();
           if (!autonomousMode)
             break;
           delay(50);

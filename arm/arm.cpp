@@ -78,7 +78,10 @@ static volatile bool cameraPoseReady = false;
 static CameraPoseData incomingCameraPose;
 
 // ================= BASE MAC =================
-uint8_t baseAddress[6] = {0x80, 0xF3, 0xDA, 0x42, 0x3E, 0x5C};
+uint8_t baseAddress[6] = {0x80, 0xF3, 0xDA, 0x42, 0x3E, 0x5D}; // base AP MAC
+
+// ================= ESP-NOW SEND STATS =================
+static volatile uint32_t espnowTxOk = 0, espnowTxFail = 0;
 
 // ================= PCA9685 =================
 Adafruit_PWMServoDriver driver = Adafruit_PWMServoDriver();
@@ -454,7 +457,10 @@ static void sendArmStatus(bool busy) {
   ArmStatus st = {};
   st.type = 0;
   st.busy = busy ? 1 : 0;
-  esp_now_send(baseAddress, (uint8_t *)&st, sizeof(st));
+  esp_err_t err = esp_now_send(baseAddress, (uint8_t *)&st, sizeof(st));
+  if (err != ESP_OK) {
+    Serial.printf("[ARM] ESP-NOW send FAILED: %d (busy=%d)\n", err, busy);
+  }
 }
 
 static void dispatchCmd(const char* cmd) {
@@ -480,8 +486,9 @@ static void dispatchCmd(const char* cmd) {
 void OnDataRecv(const uint8_t *mac_addr,
                 const uint8_t *incomingData,
                 int len) {
+  if (!incomingData || len < 1) return;
   // Camera pose packet (24 bytes, type=1)
-  if (len == sizeof(CameraPoseData)) {
+  if (len == (int)sizeof(CameraPoseData)) {
     CameraPoseData pose;
     memcpy(&pose, incomingData, sizeof(pose));
     if (pose.type == 1 && pose.pose_valid) {
@@ -496,7 +503,7 @@ void OnDataRecv(const uint8_t *mac_addr,
   }
 
   // Arm command (10 bytes)
-  if (len != sizeof(ArmCommand)) return;
+  if (len != (int)sizeof(ArmCommand)) return;
 
   ArmCommand msg;
   memcpy(&msg, incomingData, sizeof(msg));
@@ -510,14 +517,14 @@ void OnDataRecv(const uint8_t *mac_addr,
 
 // ================= WIFI RECONNECT (throttled) =================
 // Only attempts once every 5 s.  Does NOT block.
-static void checkWifi() {
-  static unsigned long lastAttempt = 0;
-  static bool wasConnected = false;
+static unsigned long lastWifiAttempt = 0;
+static bool wasWifiConnected = false;
 
+static void checkWifi() {
   bool isConnected = (WiFi.status() == WL_CONNECTED);
 
   // Detect reconnection: was not connected, now is connected
-  if (!wasConnected && isConnected) {
+  if (!wasWifiConnected && isConnected) {
     Serial.println("[ARM] WiFi reconnected, updating ESP-NOW peer channel");
     // Remove old peer, re-add with correct channel
     esp_now_del_peer(baseAddress);
@@ -532,11 +539,11 @@ static void checkWifi() {
       Serial.println("[ESP-NOW] Base peer re-added with correct channel");
     }
   }
-  wasConnected = isConnected;
+  wasWifiConnected = isConnected;
 
   if (isConnected) return;
-  if (millis() - lastAttempt < 5000) return;
-  lastAttempt = millis();
+  if (millis() - lastWifiAttempt < 5000) return;
+  lastWifiAttempt = millis();
   Serial.println("[ARM] WiFi down, reconnecting...");
   WiFi.disconnect();
   WiFi.begin("GLITCH", "Gl1tch2024!Secure");
@@ -545,10 +552,31 @@ static void checkWifi() {
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  delay(1000);   // extra settle time for PCA9685 power-on
 
-  // I2C + PCA9685 init — exact match to Blynk config
+  // I2C + PCA9685 init with retry
   Wire.begin(21, 22);
+  Wire.setTimeOut(200);  // prevent I2C bus hang
+
+  bool pcaReady = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Wire.beginTransmission(0x40);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      pcaReady = true;
+      Serial.printf("[ARM] PCA9685 found on attempt %d\n", attempt);
+      break;
+    }
+    Serial.printf("[ARM] PCA9685 not found (attempt %d, err=%d), retrying...\n", attempt, err);
+    delay(500);
+    Wire.end();
+    Wire.begin(21, 22);
+    Wire.setTimeOut(200);
+  }
+
+  if (!pcaReady) {
+    Serial.println("[ARM] WARNING: PCA9685 not responding — servos may not work");
+  }
 
   driver.begin();
   driver.setOscillatorFrequency(27000000);
@@ -564,14 +592,28 @@ void setup() {
   // WiFi STA mode — after I2C/PCA9685 (matches Blynk init order)
   WiFi.mode(WIFI_STA);
   WiFi.begin("GLITCH", "Gl1tch2024!Secure");
-  delay(500);
+
+  // Wait for WiFi connection (up to 5s) so ESP-NOW can send to base
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 5000) {
+    delay(100);
+  }
   esp_wifi_set_ps(WIFI_PS_NONE);
 
-  Serial.printf("[ARM] MAC: %s\n", WiFi.macAddress().c_str());
+  Serial.printf("[ARM] MAC: %s  WiFi: %s  ch=%d\n",
+    WiFi.macAddress().c_str(),
+    (WiFi.status() == WL_CONNECTED) ? "OK" : "DOWN",
+    WiFi.channel());
 
   // ESP-NOW init (must come after WiFi.mode)
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(OnDataRecv);
+
+    // Track ESP-NOW send delivery
+    esp_now_register_send_cb([](const uint8_t *, esp_now_send_status_t status) {
+      if (status == ESP_NOW_SEND_SUCCESS) espnowTxOk++;
+      else espnowTxFail++;
+    });
 
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, baseAddress, 6);
@@ -588,18 +630,32 @@ void setup() {
   }
 
   Serial.println("[ARM] Ready");
-  goHome();  // Move to home position (matches Blynk config)
+  // Initialize reconnect tracker so first loop() doesn't delete/re-add the peer
+  wasWifiConnected = (WiFi.status() == WL_CONNECTED);
+  // goHome() moved to loop() — blocking in setup() disrupts WiFi/ESP-NOW init
 }
 
 // ================= LOOP =================
 void loop() {
+  // Run goHome once on first iteration (was blocking setup for seconds)
+  static bool homed = false;
+  if (!homed) {
+    homed = true;
+    goHome();  // Move to home position (matches Blynk config)
+  }
+
   checkWifi();
 
   static unsigned long lastStatus = 0;
   if (millis() - lastStatus > 5000) {
     lastStatus = millis();
-    Serial.printf("[ARM] WiFi ch=%d status=%d free=%d\n",
-                  WiFi.channel(), WiFi.status(), ESP.getFreeHeap());
+    Serial.printf("[ARM] WiFi ch=%d status=%d free=%d tx_ok=%lu tx_fail=%lu\n",
+                  WiFi.channel(), WiFi.status(), ESP.getFreeHeap(),
+                  (unsigned long)espnowTxOk, (unsigned long)espnowTxFail);
+    // Heartbeat: send idle status so base knows arm is alive
+    if (WiFi.status() == WL_CONNECTED) {
+      sendArmStatus(false);
+    }
   }
 
   // Drain commands.  Send busy ONCE before batch, idle ONCE after.

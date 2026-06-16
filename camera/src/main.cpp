@@ -1,111 +1,48 @@
 /*
  * ESP32-S3 Vision - On-device QR + Pose Estimation
- * Communicates with base ESP32 via ESP-NOW.
- * Serves MJPEG stream and JSON API for dashboard.
+ * Integrated with Glitch robot project via ESP-NOW.
  */
 
 #include <Arduino.h>
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include "esp_http_server.h"
 #include "img_converters.h"
 #include "quirc.h"
-#include "platform_detect.h"
+#include "arm_pose_link.h"
 #include <math.h>
-// Removed: #include <freertos/semphr.h> - Using simple state machines instead of RTOS
+#include <freertos/semphr.h>
 
-// =================== NETWORK CONFIG ===================
-// Connect to the Base ESP32 AP so ESP-NOW node traffic and the camera HTTP
-// dashboard endpoints share the same WiFi channel.
-#define USE_AP_MODE false
-
-static const char *ap_ssid = "ESP32S3-CAM";
-static const char *ap_password = "12345678";
+// WiFi: join GLITCH AP on channel 11
 static const char *sta_ssid = "GLITCH";
 static const char *sta_password = "Gl1tch2024!Secure";
+#define WIFI_CHANNEL 11
 
-static uint8_t baseAddress[6] = {0};
+// Base ESP32 MAC Address (for ESP-NOW)
+static uint8_t baseAddress[] = {0x80, 0xF3, 0xDA, 0x42, 0x3E, 0x5D}; // base AP MAC (NOT STA MAC)
 
-static bool g_espnow_ready = false;
-static uint32_t espNowSendOk = 0;
-static uint32_t espNowSendFail = 0;
-static uint32_t espNowTxOk = 0;
-static uint32_t espNowTxFail = 0;
-static uint32_t espNowRxValid = 0;
-static uint32_t espNowRxInvalid = 0;
+#define STREAM_FRAME_SIZE FRAMESIZE_VGA
+#define STREAM_JPEG_QUALITY 12
+#define STREAM_FPS_TARGET 4
+#define LED_FLASH_PIN -1
 
-// HTTP handlers and the QR task can run on different FreeRTOS tasks.
-static SemaphoreHandle_t g_data_mutex = NULL;
-static SemaphoreHandle_t g_cam_mutex = NULL;
-static SemaphoreHandle_t g_platform_mutex = NULL;
+// QR preprocessing and detection quality controls.
+// Downscale=2 is currently the best latency/robustness compromise for GC2145.
+#define QR_DOWNSCALE 1
+#define QR_USE_ADAPTIVE_BINARIZE 1
+#define QR_MAIN_USE_ADAPTIVE 0
 
-// Timing control for non-blocking QR processing
-static unsigned long last_qr_process_time = 0;
-static const unsigned long QR_PROCESS_INTERVAL = 50; // Process QR every 50ms
+#define QR_SIZE_MM 50.0f
+#define CAMERA_FOV_DEG 62.0f
+#define MAX_QR_DETECTIONS 8
+#define MAX_QR_TEXT_LEN 256
 
-static bool basePeerKnown() {
-    for (uint8_t b : baseAddress) {
-        if (b != 0) return true;
-    }
-    return false;
-}
-
-static bool sendEspNowPacketToBase(const uint8_t *data, size_t len) {
-    if (!g_espnow_ready || !basePeerKnown()) return false;
-
-    esp_err_t result = esp_now_send(baseAddress, data, len);
-    bool ok = (result == ESP_OK);
-    if (ok) espNowSendOk++;
-    else espNowSendFail++;
-    return ok;
-}
-
-// =================== QR COLOR PARSING ===================
-enum ArmColorCode : uint8_t {
-    ARM_COLOR_UNKNOWN = 0,
-    ARM_COLOR_R = 1,
-    ARM_COLOR_G = 2,
-    ARM_COLOR_B = 3,
-};
-
-static bool starts_with_ci(const char *text, int text_len, const char *prefix) {
-    int n = (int)strlen(prefix);
-    if (!text || text_len < n) return false;
-    for (int i = 0; i < n; i++) {
-        char a = text[i];
-        char b = prefix[i];
-        if (a >= 'a' && a <= 'z') a = (char)(a - 'a' + 'A');
-        if (b >= 'a' && b <= 'z') b = (char)(b - 'a' + 'A');
-        if (a != b) return false;
-    }
-    return true;
-}
-
-static ArmColorCode arm_pose_color_from_text(const char *text, int text_len) {
-    if (!text || text_len <= 0) return ARM_COLOR_UNKNOWN;
-    if (starts_with_ci(text, text_len, "R") || starts_with_ci(text, text_len, "RED")) return ARM_COLOR_R;
-    if (starts_with_ci(text, text_len, "G") || starts_with_ci(text, text_len, "GREEN")) return ARM_COLOR_G;
-    if (starts_with_ci(text, text_len, "B") || starts_with_ci(text, text_len, "BLUE")) return ARM_COLOR_B;
-
-    for (int i = 0; i < text_len; i++) {
-        char c = text[i];
-        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-        if (c == 'R') return ARM_COLOR_R;
-        if (c == 'G') return ARM_COLOR_G;
-        if (c == 'B') return ARM_COLOR_B;
-    }
-    return ARM_COLOR_UNKNOWN;
-}
-
-// =================== ESP-NOW NODE PROTOCOL ===================
-// Packet type discriminators (must match base.ino)
+// ESP-NOW packet types (must match base.ino)
 enum EspNowPacketType : uint8_t {
-    ESPNOW_TYPE_ARM_CMD    = 0x10,
     ESPNOW_TYPE_SCAN_REQ   = 0x20,
     ESPNOW_TYPE_POSE_REPLY = 0x30,
-    ESPNOW_TYPE_CAM_POSE   = 0x40,
-    ESPNOW_TYPE_ARM_ACK    = 0xA1,
 };
 
 // ESP-NOW packet: Base -> Camera (scan request)
@@ -133,10 +70,143 @@ struct __attribute__((packed)) PoseReply {
 static volatile bool g_scan_requested = false;
 static volatile uint8_t g_scan_task_id = 0;
 static volatile uint8_t g_scan_mode = 0;
+static volatile uint8_t g_scan_miss_counter = 0;
 static portMUX_TYPE g_scan_mux = portMUX_INITIALIZER_UNLOCKED;
 
-// Latest platform detection result (for /platform HTTP endpoint)
-static PlatformResult g_last_platform = {};
+// =================== ESP-NOW TRANSPORT ===================
+static bool g_espnow_ready = false;
+static uint32_t espNowSendOk = 0;
+static uint32_t espNowSendFail = 0;
+static uint32_t espNowRxValid = 0;
+static uint32_t espNowRxInvalid = 0;
+
+static bool basePeerKnown() {
+    for (uint8_t b : baseAddress) {
+        if (b != 0) return true;
+    }
+    return false;
+}
+
+static bool sendEspNowPacketToBase(const uint8_t *data, size_t len) {
+    if (!g_espnow_ready || !basePeerKnown()) return false;
+    esp_err_t result = esp_now_send(baseAddress, data, len);
+    bool ok = (result == ESP_OK);
+    if (ok) espNowSendOk++;
+    else espNowSendFail++;
+    return ok;
+}
+
+// ESP-NOW receive callback — handles scan requests from base
+static void OnEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
+    if (!data || len < 1) { espNowRxInvalid++; return; }
+    uint8_t pktType = data[0];
+    if (pktType == ESPNOW_TYPE_SCAN_REQ && len == (int)sizeof(ScanRequest)) {
+        ScanRequest req;
+        memcpy(&req, data, sizeof(req));
+        portENTER_CRITICAL(&g_scan_mux);
+        g_scan_task_id = req.task_id;
+        g_scan_mode = req.mode;
+        g_scan_requested = true;
+        portEXIT_CRITICAL(&g_scan_mux);
+        espNowRxValid++;
+        Serial.printf("[ESP-NOW] Scan request: task=%d mode=%d\n", req.task_id, req.mode);
+        return;
+    }
+    espNowRxInvalid++;
+}
+
+static void initEspNow() {
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[ESP-NOW] Init failed");
+        return;
+    }
+    esp_now_register_recv_cb(OnEspNowRecv);
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, baseAddress, 6);
+    peerInfo.channel = WIFI_CHANNEL;
+    peerInfo.encrypt = false;
+    peerInfo.ifidx = WIFI_IF_STA;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("[ESP-NOW] Failed to add base peer");
+    } else {
+        Serial.println("[ESP-NOW] Base peer added — ready");
+        g_espnow_ready = true;
+    }
+}
+
+#define PWDN_GPIO_NUM   -1
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM   15
+#define SIOD_GPIO_NUM   4
+#define SIOC_GPIO_NUM   5
+#define Y9_GPIO_NUM     16
+#define Y8_GPIO_NUM     17
+#define Y7_GPIO_NUM     18
+#define Y6_GPIO_NUM     12
+#define Y5_GPIO_NUM     10
+#define Y4_GPIO_NUM     8
+#define Y3_GPIO_NUM     9
+#define Y2_GPIO_NUM     11
+#define VSYNC_GPIO_NUM  6
+#define HREF_GPIO_NUM   7
+#define PCLK_GPIO_NUM   13
+
+struct CameraIntrinsics {
+    // Intrinsic matrix terms:
+    // [fx  0  cx]
+    // [0  fy  cy]
+    // [0   0   1]
+    float fx, fy, cx, cy;
+};
+
+struct QRDetection {
+    // Payload fields
+    char text[MAX_QR_TEXT_LEN];
+    int text_len;
+    bool decoded;
+
+    // Tracker flags
+    bool estimated;
+    float confidence;
+    uint32_t age_ms;
+
+    // Image-space corner points in pixels, order from quirc extract
+    float corners[4][2];
+
+    // Pose in camera frame (mm + deg)
+    bool pose_valid;
+    float tx, ty, tz;
+    float roll, pitch, yaw;
+};
+
+struct QRTrackState {
+    // Single-target temporal tracker state used to bridge short detection dropouts.
+    bool active;
+    QRDetection det;
+    float confidence;
+    uint32_t last_obs_ms;
+    uint32_t last_update_ms;
+};
+
+static httpd_handle_t g_httpd = NULL;
+static httpd_handle_t g_stream_httpd = NULL;
+static bool g_camera_ok = false;
+
+static CameraIntrinsics g_K;
+static struct quirc *g_qr = NULL;
+static uint8_t *g_gray_buf = NULL;
+static uint8_t *g_proc_buf = NULL;
+static uint8_t *g_proc_gray_buf = NULL;
+static uint8_t *g_proc_raw_buf = NULL;
+static int g_frame_w = 0;
+static int g_frame_h = 0;
+static int g_proc_w = 0;
+static int g_proc_h = 0;
+static SemaphoreHandle_t g_cam_mutex = NULL;
+
+static SemaphoreHandle_t g_data_mutex = NULL;
 static QRDetection g_detections[MAX_QR_DETECTIONS];
 
 // Reusable working buffers for multi-pass quirc scans.
@@ -958,101 +1028,44 @@ static void process_qr_frame() {
         track_predict_only(now_ms);
     }
 
-    // Send pose to base via ESP-NOW when a scan was requested or periodically.
-    const QRDetection *pose_src = NULL;
-    if (g_track.active && g_track.det.pose_valid) {
-        pose_src = &g_track.det;
-    } else if (best_idx >= 0 && dets[best_idx].pose_valid) {
-        pose_src = &dets[best_idx];
-    }
-
-    // Send ESP-NOW pose reply when scan was requested or on every Nth frame.
-    static uint32_t s_espnow_frame_counter = 0;
-    s_espnow_frame_counter++;
-
-    bool local_scan_req = false;
-    uint8_t local_task_id = 0;
-    uint8_t local_scan_mode = 0;
-
-    portENTER_CRITICAL(&g_scan_mux);
+    // Only send PoseReply when a scan is requested (on-demand, not continuous).
+    // If no QR found, send pose_valid=0 with miss counter in confidence field.
     if (g_scan_requested) {
-        local_scan_req = true;
-        local_task_id = g_scan_task_id;
-        local_scan_mode = g_scan_mode;
+        uint8_t task_id;
+        portENTER_CRITICAL(&g_scan_mux);
+        task_id = g_scan_task_id;
         g_scan_requested = false;
-        g_scan_mode = 0;
-    }
-    portEXIT_CRITICAL(&g_scan_mux);
+        portEXIT_CRITICAL(&g_scan_mux);
 
-    bool should_send = local_scan_req || (s_espnow_frame_counter % 10 == 0);
-
-    if (should_send && g_espnow_ready) {
-        PoseReply reply = {};
-        reply.type = ESPNOW_TYPE_POSE_REPLY;
-        reply.task_id = local_task_id;
+        PoseReply pose_reply = {};
+        pose_reply.type = ESPNOW_TYPE_POSE_REPLY;
+        pose_reply.task_id = task_id;
+        const QRDetection *pose_src = NULL;
+        if (g_track.active && g_track.det.pose_valid) {
+            pose_src = &g_track.det;
+        } else if (best_idx >= 0 && dets[best_idx].pose_valid) {
+            pose_src = &dets[best_idx];
+        }
 
         if (pose_src) {
-            reply.pose_valid = 1;
-            reply.tx_mm = pose_src->tx;
-            reply.ty_mm = pose_src->ty;
-            reply.tz_mm = pose_src->tz;
-            reply.yaw_deg = pose_src->yaw;
-            reply.color = (uint8_t)arm_pose_color_from_text(pose_src->text, pose_src->text_len);
-            reply.estimated = pose_src->estimated ? 1 : 0;
-            reply.confidence = pose_src->confidence;
+            pose_reply.tx_mm = pose_src->tx;
+            pose_reply.ty_mm = pose_src->ty;
+            pose_reply.tz_mm = pose_src->tz;
+            pose_reply.yaw_deg = pose_src->yaw;
+            pose_reply.color = (uint8_t)arm_pose_color_from_text(pose_src->text, pose_src->text_len);
+            pose_reply.estimated = pose_src->estimated ? 1 : 0;
+            pose_reply.confidence = pose_src->confidence;
+            pose_reply.pose_valid = 1;
+            g_scan_miss_counter = 0;
+            Serial.printf("[SCAN] -> Pose sent: color=%d conf=%.2f\n", pose_reply.color, pose_reply.confidence);
         } else {
-            reply.pose_valid = 0;
-            reply.color = (uint8_t)ARM_COLOR_UNKNOWN;
-            reply.estimated = 0;
-            reply.confidence = 0.0f;
+            pose_reply.color = (uint8_t)ARM_COLOR_UNKNOWN;
+            pose_reply.pose_valid = 0;
+            pose_reply.confidence = (float)g_scan_miss_counter;
+            g_scan_miss_counter++;
+            Serial.printf("[SCAN] -> No QR found (miss #%d)\n", g_scan_miss_counter - 1);
         }
-
-        bool sent = sendEspNowPacketToBase((const uint8_t *)&reply, sizeof(reply));
-
-        if (local_scan_req) {
-            Serial.printf("[ESP-NOW] Sent pose reply for task %d: valid=%d color=%d conf=%.2f yaw=%.1f (%s)\n",
-                          reply.task_id, reply.pose_valid, reply.color, reply.confidence,
-                          reply.yaw_deg, sent ? "OK" : "FAIL");
-        }
-    }
-
-    // Platform detection: run periodically and on scan_mode==1 request
-    static uint32_t s_platform_frame_counter = 0;
-    s_platform_frame_counter++;
-    bool run_platform = (local_scan_mode == 1) || (s_platform_frame_counter % 15 == 0);
-
-    if (run_platform && g_gray_buf) {
-        uint32_t pt0 = millis();
-        PlatformResult plat = detect_platform(g_gray_buf, g_frame_w, g_frame_h);
-        
-        xSemaphoreTake(g_platform_mutex, portMAX_DELAY);
-        g_platform_detect_ms = millis() - pt0;
-        g_last_platform = plat;
-        xSemaphoreGive(g_platform_mutex);
-
-        if (plat.detected) {
-            Serial.printf("[PLATFORM] Detected: cx=%.0f cy=%.0f w=%.0f h=%.0f conf=%.2f dist=%.0fmm %ums\n",
-                          plat.center_x, plat.center_y, plat.width_px, plat.height_px,
-                          plat.confidence, plat.distance_mm, (unsigned)g_platform_detect_ms);
-
-            // Send platform position via ESP-NOW when explicitly requested.
-            if (local_scan_mode == 1 && g_espnow_ready) {
-                PoseReply preply = {};
-                preply.type = ESPNOW_TYPE_POSE_REPLY;
-                preply.task_id = local_task_id;
-                preply.pose_valid = 1;
-                preply.color = 0xFF; // special: platform detection
-                preply.estimated = 0;
-                float cx_offset = plat.center_x - (g_frame_w / 2.0f);
-                float fov_px = g_K.fx;
-                preply.yaw_deg = atan2f(cx_offset, fov_px) * 180.0f / M_PI;
-                preply.tz_mm = plat.distance_mm;
-                preply.tx_mm = plat.center_x;
-                preply.ty_mm = plat.center_y;
-                preply.confidence = plat.confidence;
-                sendEspNowPacketToBase((const uint8_t *)&preply, sizeof(preply));
-            }
-        }
+        sendEspNowPacketToBase((const uint8_t *)&pose_reply, sizeof(pose_reply));
     }
 
     if (count > 0 || valid > 0 || g_track.active) {
@@ -1130,24 +1143,26 @@ static esp_err_t data_handler(httpd_req_t *req) {
     memcpy(dets, g_detections, sizeof(QRDetection) * n);
     xSemaphoreGive(g_data_mutex);
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    char *buf = (char *)malloc(4096);
+    if (!buf) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
-    char part[384];
-    int off = snprintf(part, sizeof(part),
+    int off = snprintf(buf, 4096,
         "{\"frame_id\":%u,\"processing_ms\":%u,\"qr_fps\":%.1f,\"raw_count\":%d,\"decoded_count\":%d,\"qr_codes\":[",
         (unsigned)fid, (unsigned)proc_ms, fps, raw_count, decoded_count);
-    httpd_resp_send_chunk(req, part, off);
 
     for (int i = 0; i < n; i++) {
+        if (i > 0) buf[off++] = ',';
         char esc[MAX_QR_TEXT_LEN * 2];
         json_escape(esc, sizeof(esc), dets[i].text, dets[i].text_len);
-        off = snprintf(part, sizeof(part),
-            "%s{\"text\":\"%s\",\"decoded\":%s,\"corners\":[[%.0f,%.0f],[%.0f,%.0f],[%.0f,%.0f],[%.0f,%.0f]],"
+        off += snprintf(buf + off, 4096 - off,
+            "{\"text\":\"%s\",\"decoded\":%s,\"corners\":[[%.0f,%.0f],[%.0f,%.0f],[%.0f,%.0f],[%.0f,%.0f]],"
             "\"estimated\":%s,\"confidence\":%.3f,\"age_ms\":%u,"
             "\"pose_valid\":%s,\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.1f,"
             "\"roll\":%.1f,\"pitch\":%.1f,\"yaw\":%.1f}",
-            (i > 0) ? "," : "", esc,
+            esc,
             dets[i].decoded ? "true" : "false",
             dets[i].corners[0][0], dets[i].corners[0][1],
             dets[i].corners[1][0], dets[i].corners[1][1],
@@ -1159,11 +1174,14 @@ static esp_err_t data_handler(httpd_req_t *req) {
             dets[i].pose_valid ? "true" : "false",
             dets[i].tx, dets[i].ty, dets[i].tz,
             dets[i].roll, dets[i].pitch, dets[i].yaw);
-        httpd_resp_send_chunk(req, part, off);
     }
-    httpd_resp_send_chunk(req, "]}", 2);
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
+    off += snprintf(buf + off, 4096 - off, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    esp_err_t res = httpd_resp_send(req, buf, off);
+    free(buf);
+    return res;
 }
 
 // /stream endpoint (port 81): MJPEG stream primarily for laptop-side visualization.
@@ -1255,63 +1273,22 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 // /status endpoint: lightweight health/telemetry summary.
 static esp_err_t status_handler(httpd_req_t *req) {
     char buf[320];
-
-    xSemaphoreTake(g_data_mutex, portMAX_DELAY);
-    uint32_t proc_ms = g_processing_ms;
-    float fps = g_qr_fps;
-    int raw = g_qr_raw_count;
-    int dec = g_qr_decoded_count;
-    int dets = g_num_detections;
-    int err = g_last_decode_err;
-    int err_f = g_last_decode_err_flip;
-    uint32_t fid = g_frame_id;
-    bool track_act = g_track.active;
-    float track_cf = g_track.confidence;
-    uint32_t track_age = g_track.active ? g_track.det.age_ms : 0U;
-    xSemaphoreGive(g_data_mutex);
-
     snprintf(buf, sizeof(buf),
         "{\"camera\":\"%s\",\"free_heap\":%lu,\"psram_free\":%lu,\"qr_processing_ms\":%u,\"qr_fps\":%.1f,\"qr_raw\":%d,\"qr_decoded\":%d,\"qr_detections\":%d,\"decode_err\":%d,\"decode_err_flip\":%d,\"track_active\":%s,\"track_conf\":%.3f,\"track_age_ms\":%u,\"frame_id\":%u}",
         g_camera_ok ? "OK" : "FAILED",
         (unsigned long)ESP.getFreeHeap(),
         (unsigned long)ESP.getFreePsram(),
-        (unsigned)proc_ms,
-        fps,
-        raw,
-        dec,
-        dets,
-        err,
-        err_f,
-        track_act ? "true" : "false",
-        track_cf,
-        (unsigned)track_age,
-        (unsigned)fid);
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_sendstr(req, buf);
-}
-
-// /platform endpoint: latest platform detection result.
-static esp_err_t platform_handler(httpd_req_t *req) {
-    char buf[256];
-    
-    xSemaphoreTake(g_platform_mutex, portMAX_DELAY);
-    PlatformResult plat = g_last_platform;
-    uint32_t p_ms = g_platform_detect_ms;
-    xSemaphoreGive(g_platform_mutex);
-
-    snprintf(buf, sizeof(buf),
-        "{\"detected\":%s,\"center_x\":%.1f,\"center_y\":%.1f,\"width\":%.1f,\"height\":%.1f,\"angle\":%.1f,\"confidence\":%.3f,\"distance_mm\":%.1f,\"processing_ms\":%u}",
-        plat.detected ? "true" : "false",
-        plat.center_x,
-        plat.center_y,
-        plat.width_px,
-        plat.height_px,
-        plat.angle_deg,
-        plat.confidence,
-        plat.distance_mm,
-        (unsigned)p_ms);
+        (unsigned)g_processing_ms,
+        g_qr_fps,
+        g_qr_raw_count,
+        g_qr_decoded_count,
+        g_num_detections,
+        g_last_decode_err,
+        g_last_decode_err_flip,
+        g_track.active ? "true" : "false",
+        g_track.confidence,
+        (unsigned)(g_track.active ? g_track.det.age_ms : 0U),
+        (unsigned)g_frame_id);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -1319,7 +1296,7 @@ static esp_err_t platform_handler(httpd_req_t *req) {
 }
 
 // Start two HTTP servers:
-// - port 80 for JSON API + capture + platform
+// - port 80 for JSON API + capture
 // - port 81 for MJPEG stream
 static void startServer() {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -1332,12 +1309,11 @@ static void startServer() {
         {"/capture", HTTP_GET, capture_handler, NULL},
         {"/data", HTTP_GET, data_handler, NULL},
         {"/status", HTTP_GET, status_handler, NULL},
-        {"/platform", HTTP_GET, platform_handler, NULL},
     };
 
     if (httpd_start(&g_httpd, &cfg) == ESP_OK) {
         for (auto &u : api_uris) httpd_register_uri_handler(g_httpd, &u);
-        Serial.println("API server:    port 80  (/capture /data /status /platform)");
+        Serial.println("API server:    port 80  (/capture /data /status)");
     }
 
     httpd_config_t scfg = HTTPD_DEFAULT_CONFIG();
@@ -1403,107 +1379,38 @@ static bool initCamera() {
     return true;
 }
 
-static void OnDataSent(const uint8_t *mac, esp_now_send_status_t status) {
-    (void)mac;
-    if (status == ESP_NOW_SEND_SUCCESS) espNowTxOk++;
-    else espNowTxFail++;
-}
-
-// ESP-NOW receive callback: scan requests from base.
-static void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-    if (!mac || !incomingData || len < 1 || memcmp(mac, baseAddress, 6) != 0) {
-        espNowRxInvalid++;
-        return;
-    }
-
-    uint8_t pktType = incomingData[0];
-    if (pktType == ESPNOW_TYPE_SCAN_REQ && len == (int)sizeof(ScanRequest)) {
-        ScanRequest req;
-        memcpy(&req, incomingData, sizeof(req));
-        portENTER_CRITICAL(&g_scan_mux);
-        g_scan_task_id = req.task_id;
-        g_scan_mode = req.mode;
-        g_scan_requested = true;
-        portEXIT_CRITICAL(&g_scan_mux);
-        espNowRxValid++;
-        Serial.printf("[ESP-NOW] Scan request: task=%d mode=%d\n", req.task_id, req.mode);
-        return;
-    }
-
-    espNowRxInvalid++;
-}
-
-// Initialize network and ESP-NOW transport.
+// Initialize network in STA mode — join GLITCH AP
 static void initWiFi() {
-    if (USE_AP_MODE) {
-        WiFi.mode(WIFI_AP);
-        WiFi.setSleep(false);
-        WiFi.softAP(ap_ssid, ap_password);
-        Serial.printf("AP Mode - SSID: %s IP: %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
+    WiFi.mode(WIFI_STA);
+    // Set static IP so the dashboard always knows where the stream is
+    IPAddress staticIP(192, 168, 4, 100);
+    IPAddress gateway(192, 168, 4, 1);
+    IPAddress subnet(255, 255, 255, 0);
+    WiFi.config(staticIP, gateway, subnet);
+
+    WiFi.begin(sta_ssid, sta_password);
+    Serial.print("Connecting to GLITCH AP");
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 60) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\nConnected - IP: %s\n", WiFi.localIP().toString().c_str());
     } else {
-        WiFi.mode(WIFI_STA);
-        WiFi.setSleep(false);
-        WiFi.begin(sta_ssid, sta_password);
-        Serial.print("Connecting to WiFi");
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 60) {
-            delay(500);
-            Serial.print(".");
-            attempts++;
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("\nConnected - IP: %s\n", WiFi.localIP().toString().c_str());
-            memcpy(baseAddress, WiFi.BSSID(), 6);
-            Serial.printf("BASE AP MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                          baseAddress[0], baseAddress[1], baseAddress[2],
-                          baseAddress[3], baseAddress[4], baseAddress[5]);
-        } else {
-            Serial.println("\nWiFi failed, fallback AP mode");
-            WiFi.mode(WIFI_AP);
-            WiFi.softAP(ap_ssid, ap_password);
-            Serial.printf("AP fallback - SSID: %s IP: %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
-        }
+        Serial.println("\nWiFi connection failed!");
     }
-
-    Serial.print("CAMERA MAC: ");
-    Serial.println(WiFi.macAddress());
-    Serial.print("CAMERA IP: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("CAMERA CHANNEL: ");
-    Serial.println(WiFi.channel());
-}
-
-static void initEspNow() {
-    if (!basePeerKnown()) {
-        Serial.println("[ESP-NOW] Base AP peer unavailable");
-        return;
-    }
-
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("[ESP-NOW] Init failed");
-        return;
-    }
-
-    esp_now_register_send_cb(OnDataSent);
-    esp_now_register_recv_cb(OnDataRecv);
-
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, baseAddress, 6);
-    peerInfo.channel = WiFi.channel();
-    peerInfo.ifidx = WIFI_IF_STA;
-    peerInfo.encrypt = false;
-
-    esp_err_t addResult = esp_now_add_peer(&peerInfo);
-    if (addResult != ESP_OK && addResult != ESP_ERR_ESPNOW_EXIST) {
-        Serial.printf("[ESP-NOW] Base peer add failed: %d\n", (int)addResult);
-        return;
-    }
-
-    g_espnow_ready = true;
-    Serial.printf("[ESP-NOW] Ready on channel %u\n", (unsigned)WiFi.channel());
 }
 
 void setup() {
+    // Boot sequence:
+    // 1) serial and basic IO
+    // 2) synchronization primitives
+    // 3) network + camera
+    // 4) QR engine init
+    // 5) start API/stream servers
+    // 6) start dedicated QR processing task
     Serial.begin(115200);
     delay(1000);
 
@@ -1514,7 +1421,6 @@ void setup() {
 
     g_data_mutex = xSemaphoreCreateMutex();
     g_cam_mutex = xSemaphoreCreateMutex();
-    g_platform_mutex = xSemaphoreCreateMutex();
 
     initWiFi();
     initEspNow();
@@ -1537,14 +1443,7 @@ void setup() {
 
     if (g_camera_ok) init_qr(fw, fh);
 
-    // Initialize platform detector
-    if (g_camera_ok) {
-        if (!platform_detect_init(fw, fh)) {
-            Serial.println("[WARN] Platform detector init failed (non-critical)");
-        }
-    }
-
-    startServer();
+    startServer(); // Re-enabled for dashboard camera stream
 
     if (g_camera_ok && g_qr && g_gray_buf && g_proc_buf) {
         xTaskCreatePinnedToCore(
@@ -1554,7 +1453,6 @@ void setup() {
                 uint32_t fps_t0 = millis();
                 while (true) {
                     process_qr_frame();
-                    vTaskDelay(1);
                     fps_count++;
                     uint32_t now = millis();
                     if (now - fps_t0 >= 2000) {
@@ -1581,27 +1479,53 @@ void loop() {
     // Real vision work runs continuously in qr_task and HTTP handlers.
     static uint32_t last = 0;
 
+    // WiFi reconnect (throttled — same pattern as arm firmware)
+    static unsigned long lastWifiAttempt = 0;
+    static bool wasWifiConnected = false;
+    bool isWifiConnected = (WiFi.status() == WL_CONNECTED);
+
+    if (!wasWifiConnected && isWifiConnected) {
+        Serial.println("[WiFi] Reconnected, re-adding ESP-NOW peer on correct channel");
+        esp_now_del_peer(baseAddress);
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, baseAddress, 6);
+        peerInfo.channel = WIFI_CHANNEL;
+        peerInfo.encrypt = false;
+        peerInfo.ifidx = WIFI_IF_STA;
+        if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+            g_espnow_ready = true;
+            Serial.println("[ESP-NOW] Base peer re-added — ready");
+        }
+    }
+    wasWifiConnected = isWifiConnected;
+
+    if (!isWifiConnected && millis() - lastWifiAttempt > 10000) {
+        lastWifiAttempt = millis();
+        Serial.println("[WiFi] Retrying connection to GLITCH AP...");
+        WiFi.disconnect();
+        delay(100);
+        WiFi.mode(WIFI_STA);
+        esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        WiFi.begin(sta_ssid, sta_password);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+    }
+
     // Emit a low-rate heartbeat for field diagnostics (every 10 seconds).
     if (millis() - last > 10000) {
-        Serial.printf("[Health] heap=%lu psram=%lu wifi=%s cam=%s espnow=%s qr_fps=%.1f det=%d proc=%ums\n",
+        Serial.printf("[Health] heap=%lu psram=%lu wifi=%s(%s ch=%d) cam=%s qr_fps=%.1f det=%d proc=%ums espnow_tx=%lu/%lu rx=%lu/%lu\n",
             (unsigned long)ESP.getFreeHeap(),
             (unsigned long)ESP.getFreePsram(),
-            (WiFi.status() == WL_CONNECTED || USE_AP_MODE) ? "OK" : "DOWN",
+            (WiFi.status() == WL_CONNECTED) ? "OK" : "DOWN",
+            WiFi.SSID().c_str(), WiFi.channel(),
             g_camera_ok ? "OK" : "FAIL",
-            g_espnow_ready ? "OK" : "DOWN",
             g_qr_fps,
             g_num_detections,
-            (unsigned)g_processing_ms);
-        Serial.printf("[ESP-NOW] send ok/fail=%lu/%lu tx ok/fail=%lu/%lu rx ok/bad=%lu/%lu\n",
-            (unsigned long)espNowSendOk,
-            (unsigned long)espNowSendFail,
-            (unsigned long)espNowTxOk,
-            (unsigned long)espNowTxFail,
-            (unsigned long)espNowRxValid,
-            (unsigned long)espNowRxInvalid);
+            (unsigned)g_processing_ms,
+            (unsigned long)espNowSendOk, (unsigned long)espNowSendFail,
+            (unsigned long)espNowRxValid, (unsigned long)espNowRxInvalid);
         last = millis();
     }
 
-    // Sleep briefly; qr_task keeps processing frames meanwhile.
-    delay(10);
+    // Sleep to avoid busy-waiting; qr_task keeps processing frames meanwhile.
+    delay(1000);
 }
