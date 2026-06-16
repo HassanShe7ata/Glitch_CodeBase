@@ -552,40 +552,18 @@ static void checkWifi() {
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  delay(1000);   // extra settle time for PCA9685 power-on
 
-  // I2C + PCA9685 init with retry
+  // I2C + PCA9685 init (matches Blynk reference — clean, no retry/probe)
   Wire.begin(21, 22);
-  Wire.setTimeOut(200);  // prevent I2C bus hang
-
-  bool pcaReady = false;
-  for (int attempt = 1; attempt <= 3; attempt++) {
-    Wire.beginTransmission(0x40);
-    uint8_t err = Wire.endTransmission();
-    if (err == 0) {
-      pcaReady = true;
-      Serial.printf("[ARM] PCA9685 found on attempt %d\n", attempt);
-      break;
-    }
-    Serial.printf("[ARM] PCA9685 not found (attempt %d, err=%d), retrying...\n", attempt, err);
-    delay(500);
-    Wire.end();
-    Wire.begin(21, 22);
-    Wire.setTimeOut(200);
-  }
-
-  if (!pcaReady) {
-    Serial.println("[ARM] WARNING: PCA9685 not responding — servos may not work");
-  }
 
   driver.begin();
   driver.setOscillatorFrequency(27000000);
   driver.setPWMFreq(SERVO_FREQ);
 
-  // Initialize all servos to starting positions
   for (int i = 0; i < NUM_SERVOS; i++) {
     driver.setPWM(i, 0, angleToPulse(currentAngle[i]));
   }
+
   delay(1000);
   Serial.println("[ARM] PCA9685 init done");
 
