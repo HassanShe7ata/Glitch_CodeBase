@@ -253,6 +253,9 @@ static void cameraToBase(float tx_cam, float ty_cam, float tz_cam,
 void GreenToCar();
 void BlueToCar();
 void RedToCar();
+void GreenToPlatform();
+void BlueToPlatform();
+void RedToPlatform();
 
 // ================= CAMERA-GUIDED PICKUP =================
 // Called from loop() when camera pose data arrives via ESP-NOW.
@@ -471,6 +474,51 @@ void RedToCar() {
   goHome();
 }
 
+// ================= COLOR TO PLATFORM =================
+// Pick from color position, place on platform (posRod).
+
+void GreenToPlatform() {
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 1);
+  delay(200);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
+  delay(200);
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0);
+  goHome();
+}
+
+void BlueToPlatform() {
+  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 0);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2], posBlue[3], 0);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2], posBlue[3], 1);
+  delay(200);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
+  delay(200);
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0);
+  goHome();
+}
+
+void RedToPlatform() {
+  moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 0);
+  moveRobot(posRed[0], posRed[1], posRed[2], posRed[3], 0);
+  moveRobot(posRed[0], posRed[1], posRed[2], posRed[3], 1);
+  delay(200);
+  moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
+  delay(200);
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0);
+  goHome();
+}
+
 // ================= CAR TO PLATFORM (manual pickup) =================
 // Approach sequence: moves to posRod with gripper open.
 // User then manually adjusts with step buttons and grips.
@@ -508,6 +556,12 @@ static void dispatchCmd(const char *cmd) {
     RedToFloor();
   else if (strcmp(cmd, "CTP") == 0)
     CarToPlatform();
+  else if (strcmp(cmd, "GTP") == 0)
+    GreenToPlatform();
+  else if (strcmp(cmd, "RTP") == 0)
+    RedToPlatform();
+  else if (strcmp(cmd, "BTP") == 0)
+    BlueToPlatform();
   else if (strcmp(cmd, "H") == 0)
     goHome();
   else if (strcmp(cmd, "S") == 0)
