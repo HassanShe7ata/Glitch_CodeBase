@@ -483,6 +483,7 @@ void GreenToPlatform() {
   moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 1);
   delay(200);
   moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 1);
+  moveRobot(0, 90, 150, -20, 1);
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
@@ -497,6 +498,7 @@ void BlueToPlatform() {
   moveRobot(posBlue[0], posBlue[1], posBlue[2], posBlue[3], 1);
   delay(200);
   moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 1);
+  moveRobot(0, 90, 150, -20, 1);
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
@@ -511,6 +513,7 @@ void RedToPlatform() {
   moveRobot(posRed[0], posRed[1], posRed[2], posRed[3], 1);
   delay(200);
   moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 1);
+  moveRobot(0, 90, 150, -20, 1);
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
