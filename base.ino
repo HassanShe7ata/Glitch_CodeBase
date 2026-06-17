@@ -151,11 +151,11 @@ float currentYaw = 0;
 float targetHeading = 0;
 void updateYaw();
 
-// --- CALIBRATED TICK CONSTANTS (WEIGHT-AWARE × 97/80) ---
+// --- CALIBRATED TICK CONSTANTS (Blynk values × 97/80, distance in meters) ---
 const float TICKS_FWD_BWD = 6717.25f;
-const float TICKS_STRAFE = 7581.71f;
-const float TICKS_DIAG = 9548.44f;
-const float TICKS_ROTATE = 8730.00f;
+const float TICKS_STRAFE  = 7581.71f;
+const float TICKS_DIAG    = 9548.44f;
+const float TICKS_ROTATE  = 8730.00f;
 
 int8_t Motor_speed = 25;
 
@@ -915,15 +915,19 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
     <div class="card" id="camCard">
         <h2>Camera</h2>
         <div class="telemetry">
-            <div class="tile" style="grid-column:span 2"><div class="label">Scan Status</div><div class="val small" id="camScanStatus">--</div></div>
-            <div class="tile" style="grid-column:span 2"><div class="label">Heading</div><div class="val" id="heading">0.0°</div></div>
-            <div class="tile"><div class="label">QR Message</div><div class="val small" id="camMsg">--</div></div>
+            <div class="tile" style="grid-column:span 2"><div class="label">Heading</div><div class="val" id="heading">0.0&deg;</div></div>
+            <div class="tile"><div class="label">QR Msg</div><div class="val small" id="camMsg">--</div></div>
             <div class="tile"><div class="label">Color</div><div class="val" id="camColor">--</div></div>
-            <div class="tile"><div class="label">Distance</div><div class="val" id="camDist">--</div></div>
-            <div class="tile"><div class="label">Yaw</div><div class="val" id="camYaw">--</div></div>
             <div class="tile"><div class="label">Confidence</div><div class="val" id="camConf">--</div></div>
             <div class="tile"><div class="label">Pose (x,y,z)</div><div class="val small" id="camPose">--</div></div>
         </div>
+    </div>
+
+    <div class="card">
+        <h2>Event Log</h2>
+        <div class="log" id="log"></div>
+    </div>
+    </div>
     </div>
 
     <div class="card">
@@ -976,27 +980,16 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
                     scanActive=true;
                     scanBtn.textContent='Scanning...';
                     scanBtn.classList.add('scanning');
-                    $('camScanStatus').textContent='Accumulating';
-                    $('camScanStatus').style.color='var(--warn)';
                 }else{
                     scanActive=false;
                     scanBtn.textContent='Scan QR';
                     scanBtn.classList.remove('scanning');
-                    if(lastPose.valid){
-                        $('camScanStatus').textContent='DONE';
-                        $('camScanStatus').style.color='var(--ok)';
-                    }else{
-                        $('camScanStatus').textContent='Ready';
-                        $('camScanStatus').style.color='var(--text)';
-                    }
                 }
 
                 if(s.color&&s.color!=='NONE'){
                     $('camCard').style.display='';
                     $('camColor').textContent=s.color;
                     $('camConf').textContent=s.confidence!=null?(parseFloat(s.confidence)).toFixed(2):'--';
-                    $('camDist').textContent=s.distance_mm!=null?s.distance_mm+'mm':'--';
-                    $('camYaw').textContent=s.yaw!=null?parseFloat(s.yaw).toFixed(1)+'\u00B0':'--';
                     $('camPose').textContent=(s.tx_mm!=null?s.tx_mm:'--')+', '+(s.ty_mm!=null?s.ty_mm:'--')+', '+(s.distance_mm!=null?s.distance_mm:'--');
                 }
                 if(s.qr_result){
@@ -1055,12 +1048,8 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
                 scanActive=true;
                 $('camMsg').textContent='--';
                 $('camColor').textContent='--';
-                $('camDist').textContent='--';
-                $('camYaw').textContent='--';
                 $('camConf').textContent='--';
                 $('camPose').textContent='--';
-                $('camScanStatus').textContent='Scanning...';
-                $('camScanStatus').style.color='var(--warn)';
                 lastPose={valid:false,color:0,tx:0,ty:0,tz:0,yaw:0,conf:0,msg:''};
             }
         });
@@ -1300,7 +1289,7 @@ void loop() {
 
   // =================== STEP HANDLER ===================
   if (pendingStep && !moveActive) {
-    float stepDist = 50.0;
+    float stepDist = 0.05;
     float stepDeg = 15.0;
     if (stepArg == "FWD") {
       moveDistanceKp(V_FORWARD, Motor_speed, stepDist, TICKS_FWD_BWD);
@@ -1338,8 +1327,8 @@ void loop() {
 
   // =================== AUTONOMOUS SEQUENCE ===================
   // Fixed competition sequence — runs to completion once started.
-  // To modify: change distances (mm), arm commands, or step order.
-  // Each step: movement (vector + distance in mm) or arm action (command + wait).
+  // To modify: change distances (meters), arm commands, or step order.
+  // Each step: movement (vector + distance in meters) or arm action (command + wait).
   // Sequence: FWD 1m -> Red->Plat -> LEFT 1m -> BACK 1m -> Blue->Plat
   //           -> RIGHT 1m -> Green->Plat -> DIAG 1m
   // Toggle autonomous OFF to stop mid-sequence.
@@ -1349,7 +1338,7 @@ void loop() {
 
     // --- Step 1: Move FORWARD 1 meter ---
     Serial.println("[AUTO] Step 1: Forward 1m");
-    moveDistanceKp(V_FORWARD, Motor_speed, 1000.0, TICKS_FWD_BWD);
+    moveDistanceKp(V_FORWARD, Motor_speed, 1.0, TICKS_FWD_BWD);
     if (!autonomousMode) goto autoEnd;
 
     // --- Step 2: Drop RED box on platform ---
@@ -1361,12 +1350,12 @@ void loop() {
 
     // --- Step 3: Move LEFT 1 meter ---
     Serial.println("[AUTO] Step 3: Left 1m");
-    moveDistanceKp(V_STRAFE_L, Motor_speed, 1000.0, TICKS_STRAFE);
+    moveDistanceKp(V_STRAFE_L, Motor_speed, 1.0, TICKS_STRAFE);
     if (!autonomousMode) goto autoEnd;
 
     // --- Step 4: Move BACKWARD 1 meter ---
     Serial.println("[AUTO] Step 4: Backward 1m");
-    moveDistanceKp(V_BACKWARD, Motor_speed, 1000.0, TICKS_FWD_BWD);
+    moveDistanceKp(V_BACKWARD, Motor_speed, 1.0, TICKS_FWD_BWD);
     if (!autonomousMode) goto autoEnd;
 
     // --- Step 5: Drop BLUE box on platform ---
@@ -1377,7 +1366,7 @@ void loop() {
 
     // --- Step 6: Move RIGHT 1 meter ---
     Serial.println("[AUTO] Step 6: Right 1m");
-    moveDistanceKp(V_STRAFE_R, Motor_speed, 1000.0, TICKS_STRAFE);
+    moveDistanceKp(V_STRAFE_R, Motor_speed, 1.0, TICKS_STRAFE);
     if (!autonomousMode) goto autoEnd;
 
     // --- Step 7: Drop GREEN box on platform ---
@@ -1388,7 +1377,7 @@ void loop() {
 
     // --- Step 8: Move DIAGONAL (forward-right) 1 meter ---
     Serial.println("[AUTO] Step 8: Diagonal 1m");
-    moveDistanceKp(V_DIAG_FR, Motor_speed, 1000.0, TICKS_DIAG);
+    moveDistanceKp(V_DIAG_FR, Motor_speed, 1.0, TICKS_DIAG);
 
     Serial.println("[AUTO] === Sequence complete ===");
     autoEnd:
