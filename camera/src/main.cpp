@@ -65,13 +65,22 @@ struct __attribute__((packed)) PoseReply {
     float tz_mm;
     float yaw_deg;
     float confidence;
+    uint8_t status;      // 0=Accumulating, 1=DONE
 };
 
 static volatile bool g_scan_requested = false;
 static volatile uint8_t g_scan_task_id = 0;
 static volatile uint8_t g_scan_mode = 0;
-static volatile uint8_t g_scan_miss_counter = 0;
 static portMUX_TYPE g_scan_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Scan lifecycle states
+enum ScanState : uint8_t {
+    SCAN_SLEEP  = 0,   // qr_task blocked on semaphore, no processing
+    SCAN_ACTIVE = 1,   // processing frames, accumulating detections
+};
+static volatile ScanState g_scan_state = SCAN_SLEEP;
+static volatile bool g_scan_restart = false;  // set by callback, checked by qr_task
+static SemaphoreHandle_t g_scan_wake_sem = NULL;
 
 // =================== ESP-NOW TRANSPORT ===================
 static bool g_espnow_ready = false;
@@ -98,7 +107,7 @@ static bool sendEspNowPacketToBase(const uint8_t *data, size_t len) {
 
 // ESP-NOW receive callback — handles scan requests from base
 static void OnEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
-    if (!data || len < 1) { espNowRxInvalid++; return; }
+    if (!mac || !data || len < 1) { espNowRxInvalid++; return; }
     uint8_t pktType = data[0];
     if (pktType == ESPNOW_TYPE_SCAN_REQ && len == (int)sizeof(ScanRequest)) {
         ScanRequest req;
@@ -110,6 +119,22 @@ static void OnEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
         portEXIT_CRITICAL(&g_scan_mux);
         espNowRxValid++;
         Serial.printf("[ESP-NOW] Scan request: task=%d mode=%d\n", req.task_id, req.mode);
+
+        // Wake qr_task from sleep, or restart if already scanning
+        if (!g_scan_wake_sem) { espNowRxValid++; return; }  // camera not initialized
+        portENTER_CRITICAL(&g_scan_mux);
+        ScanState st = g_scan_state;
+        portEXIT_CRITICAL(&g_scan_mux);
+        if (st == SCAN_SLEEP) {
+            portENTER_CRITICAL(&g_scan_mux);
+            g_scan_state = SCAN_ACTIVE;
+            portEXIT_CRITICAL(&g_scan_mux);
+            xSemaphoreGive(g_scan_wake_sem);
+        } else {
+            // Already scanning — signal qr_task to restart (no direct mutation)
+            g_scan_restart = true;
+            Serial.printf("[SCAN] Restart requested by new scan (task=%d)\n", req.task_id);
+        }
         return;
     }
     espNowRxInvalid++;
@@ -190,6 +215,30 @@ struct QRTrackState {
     uint32_t last_update_ms;
 };
 
+// Accumulation state (only accessed from qr_task, no lock needed)
+static QRDetection g_best_detection;
+static float g_best_prob = -1.0f;
+static uint32_t g_stable_count = 0;
+static uint32_t g_scan_frame_count = 0;
+static uint32_t g_scan_start_ms = 0;
+static uint8_t g_scan_retries = 0;
+
+// Track last sent values to avoid redundant ESP-NOW sends
+static float g_last_sent_confidence = -1.0f;
+static float g_last_sent_tx = 0, g_last_sent_ty = 0, g_last_sent_tz = 0;
+static float g_last_sent_yaw = 0;
+static uint8_t g_last_sent_color = 0;
+static bool g_initial_sent = false;
+
+// Scan accumulation thresholds
+#define SCAN_STABLE_FRAMES     7        // consecutive stable frames before DONE
+#define SCAN_TIMEOUT_MS        10000UL  // max scan duration per attempt (10 seconds)
+#define SCAN_MAX_RETRIES       3        // auto-retry on timeout with no detection
+#define SCAN_MIN_CONFIDENCE    0.65f    // min tracker confidence for stability
+#define SCAN_UPDATE_CONF_STEP  0.10f    // send update when confidence improves by >=10%
+#define SCAN_UPDATE_POSE_STEP  5.0f     // send update when pose changes by >=5mm
+#define SCAN_UPDATE_YAW_STEP   5.0f     // send update when yaw changes by >=5 degrees
+
 static httpd_handle_t g_httpd = NULL;
 static httpd_handle_t g_stream_httpd = NULL;
 static bool g_camera_ok = false;
@@ -227,10 +276,10 @@ static QRTrackState g_track = {0};
 // Tracker tuning knobs:
 // - HOLD/TAU/MIN_CONF define how long estimates remain usable after observation loss.
 // - OBS_ACCEPT_PROB controls how strict we are before accepting new observations.
-#define TRACK_MAX_HOLD_MS 3500U
-#define TRACK_DECAY_TAU_MS 2600.0f
-#define TRACK_MIN_CONF 0.10f
-#define OBS_ACCEPT_PROB 0.15f
+#define TRACK_MAX_HOLD_MS 5000U
+#define TRACK_DECAY_TAU_MS 3500.0f
+#define TRACK_MIN_CONF 0.08f
+#define OBS_ACCEPT_PROB 0.10f
 
 // Robustness-first but decode-enabled: user prefers payload visibility over speed.
 #define ENABLE_PAYLOAD_DECODE 1
@@ -857,6 +906,70 @@ static void init_qr(int frame_w, int frame_h) {
                   g_frame_w, g_frame_h, g_proc_w, g_proc_h);
 }
 
+// Determine if accumulated data has changed enough to justify an ESP-NOW send.
+static bool shouldSendUpdate() {
+    if (!g_initial_sent) return true;
+
+    const QRDetection *src = g_track.active ? &g_track.det :
+                             (g_best_prob >= 0 ? &g_best_detection : NULL);
+    if (!src) return false;
+
+    uint8_t color = (uint8_t)arm_pose_color_from_text(src->text, src->text_len);
+    if (color != g_last_sent_color) return true;
+    if (src->confidence - g_last_sent_confidence >= SCAN_UPDATE_CONF_STEP) return true;
+    if (fabsf(src->tx - g_last_sent_tx) >= SCAN_UPDATE_POSE_STEP) return true;
+    if (fabsf(src->ty - g_last_sent_ty) >= SCAN_UPDATE_POSE_STEP) return true;
+    if (fabsf(src->tz - g_last_sent_tz) >= SCAN_UPDATE_POSE_STEP) return true;
+    if (fabsf(src->yaw - g_last_sent_yaw) >= SCAN_UPDATE_YAW_STEP) return true;
+    return false;
+}
+
+// Send a PoseReply with the current accumulated data.
+// status: 0=Accumulating, 1=DONE
+static void sendPoseUpdate(uint8_t status) {
+    PoseReply r = {};
+    r.type = ESPNOW_TYPE_POSE_REPLY;
+    portENTER_CRITICAL(&g_scan_mux);
+    r.task_id = g_scan_task_id;
+    portEXIT_CRITICAL(&g_scan_mux);
+    r.status = status;
+
+    const QRDetection *src = NULL;
+    if (g_track.active && g_track.det.pose_valid) {
+        src = &g_track.det;
+    } else if (g_best_prob >= 0.0f && g_best_detection.pose_valid) {
+        src = &g_best_detection;
+    }
+
+    if (src) {
+        r.tx_mm = src->tx;
+        r.ty_mm = src->ty;
+        r.tz_mm = src->tz;
+        r.yaw_deg = src->yaw;
+        r.color = (uint8_t)arm_pose_color_from_text(src->text, src->text_len);
+        r.estimated = src->estimated ? 1 : 0;
+        r.confidence = src->confidence;
+        r.pose_valid = 1;
+
+        g_last_sent_confidence = r.confidence;
+        g_last_sent_tx = r.tx_mm;
+        g_last_sent_ty = r.ty_mm;
+        g_last_sent_tz = r.tz_mm;
+        g_last_sent_yaw = r.yaw_deg;
+        g_last_sent_color = r.color;
+    } else {
+        r.color = (uint8_t)ARM_COLOR_UNKNOWN;
+        r.pose_valid = 0;
+        r.confidence = 0;
+    }
+
+    sendEspNowPacketToBase((const uint8_t *)&r, sizeof(r));
+    Serial.printf("[SCAN] -> %s: color=%d conf=%.2f pose=(%.0f,%.0f,%.0f) frames=%lu\n",
+                  status == 1 ? "DONE" : "ACC",
+                  r.color, r.confidence, r.tx_mm, r.ty_mm, r.tz_mm,
+                  (unsigned long)g_scan_frame_count);
+}
+
 // Core QR processing routine executed by dedicated qr_task.
 // Pipeline:
 // 1) capture frame under camera mutex
@@ -1028,44 +1141,85 @@ static void process_qr_frame() {
         track_predict_only(now_ms);
     }
 
-    // Only send PoseReply when a scan is requested (on-demand, not continuous).
-    // If no QR found, send pose_valid=0 with miss counter in confidence field.
-    if (g_scan_requested) {
-        uint8_t task_id;
-        portENTER_CRITICAL(&g_scan_mux);
-        task_id = g_scan_task_id;
-        g_scan_requested = false;
-        portEXIT_CRITICAL(&g_scan_mux);
+    // Accumulation: send partial results during scan, final result on completion
+    if (g_scan_state == SCAN_ACTIVE) {
+        g_scan_frame_count++;
 
-        PoseReply pose_reply = {};
-        pose_reply.type = ESPNOW_TYPE_POSE_REPLY;
-        pose_reply.task_id = task_id;
-        const QRDetection *pose_src = NULL;
-        if (g_track.active && g_track.det.pose_valid) {
-            pose_src = &g_track.det;
-        } else if (best_idx >= 0 && dets[best_idx].pose_valid) {
-            pose_src = &dets[best_idx];
+        // Update best detection across all frames
+        if (best_idx >= 0 && best_p > g_best_prob) {
+            g_best_detection = dets[best_idx];
+            g_best_prob = best_p;
         }
 
-        if (pose_src) {
-            pose_reply.tx_mm = pose_src->tx;
-            pose_reply.ty_mm = pose_src->ty;
-            pose_reply.tz_mm = pose_src->tz;
-            pose_reply.yaw_deg = pose_src->yaw;
-            pose_reply.color = (uint8_t)arm_pose_color_from_text(pose_src->text, pose_src->text_len);
-            pose_reply.estimated = pose_src->estimated ? 1 : 0;
-            pose_reply.confidence = pose_src->confidence;
-            pose_reply.pose_valid = 1;
-            g_scan_miss_counter = 0;
-            Serial.printf("[SCAN] -> Pose sent: color=%d conf=%.2f\n", pose_reply.color, pose_reply.confidence);
+        // Check stability: tracker active, pose valid, decoded, confidence high, same color
+        bool frame_stable = (g_track.active &&
+                             g_track.det.pose_valid &&
+                             g_track.det.decoded &&
+                             g_track.confidence >= SCAN_MIN_CONFIDENCE);
+
+        if (frame_stable) {
+            uint8_t frame_color = (uint8_t)arm_pose_color_from_text(
+                g_track.det.text, g_track.det.text_len);
+            uint8_t best_color = (uint8_t)arm_pose_color_from_text(
+                g_best_detection.text, g_best_detection.text_len);
+            if (frame_color == best_color && best_color != ARM_COLOR_UNKNOWN) {
+                g_stable_count++;
+            } else {
+                g_stable_count = 0;
+            }
         } else {
-            pose_reply.color = (uint8_t)ARM_COLOR_UNKNOWN;
-            pose_reply.pose_valid = 0;
-            pose_reply.confidence = (float)g_scan_miss_counter;
-            g_scan_miss_counter++;
-            Serial.printf("[SCAN] -> No QR found (miss #%d)\n", g_scan_miss_counter - 1);
+            g_stable_count = 0;
         }
-        sendEspNowPacketToBase((const uint8_t *)&pose_reply, sizeof(pose_reply));
+
+        uint32_t elapsed = millis() - g_scan_start_ms;
+        bool timeout_reached = (elapsed >= SCAN_TIMEOUT_MS);
+        bool stable_enough = (g_stable_count >= SCAN_STABLE_FRAMES);
+        const QRDetection *src = g_track.active ? &g_track.det :
+                                 (g_best_prob >= 0 ? &g_best_detection : NULL);
+        bool has_detection = (src && src->pose_valid && src->confidence > 0.0f &&
+                              arm_pose_color_from_text(src->text, src->text_len) != ARM_COLOR_UNKNOWN);
+
+        if (stable_enough || (timeout_reached && has_detection)) {
+            // SUCCESS: valid detection found — send DONE, return to sleep
+            sendPoseUpdate(1);
+            g_scan_state = SCAN_SLEEP;
+            g_stable_count = 0;
+            g_scan_frame_count = 0;
+            g_scan_retries = 0;
+            g_initial_sent = false;
+            g_last_sent_confidence = -1.0f;
+        } else if (timeout_reached && !has_detection) {
+            // TIMEOUT with no detection — auto-retry or give up
+            g_scan_retries++;
+            if (g_scan_retries < SCAN_MAX_RETRIES) {
+                Serial.printf("[SCAN] No detection on attempt %d/%d — retrying\n",
+                              g_scan_retries, SCAN_MAX_RETRIES);
+                g_scan_start_ms = millis();
+                g_scan_frame_count = 0;
+                g_stable_count = 0;
+                memset(&g_best_detection, 0, sizeof(g_best_detection));
+                g_best_prob = -1.0f;
+                g_track.active = false;
+                g_initial_sent = false;
+                g_last_sent_confidence = -1.0f;
+                g_last_sent_yaw = 0;
+                g_last_sent_color = 0;
+            } else {
+                // Exhausted retries — give up, send DONE with no detection
+                Serial.printf("[SCAN] No detection after %d attempts — giving up\n", g_scan_retries);
+                sendPoseUpdate(1);
+                g_scan_state = SCAN_SLEEP;
+                g_stable_count = 0;
+                g_scan_frame_count = 0;
+                g_scan_retries = 0;
+                g_initial_sent = false;
+                g_last_sent_confidence = -1.0f;
+            }
+        } else if (shouldSendUpdate()) {
+            // PARTIAL: send with status=Accumulating
+            sendPoseUpdate(0);
+            g_initial_sent = true;
+        }
     }
 
     if (count > 0 || valid > 0 || g_track.active) {
@@ -1446,13 +1600,50 @@ void setup() {
     startServer(); // Re-enabled for dashboard camera stream
 
     if (g_camera_ok && g_qr && g_gray_buf && g_proc_buf) {
+        g_scan_wake_sem = xSemaphoreCreateBinary();
+
         xTaskCreatePinnedToCore(
             [](void *) {
-                // qr_task loops forever and updates g_qr_fps every 2 seconds.
                 uint32_t fps_count = 0;
                 uint32_t fps_t0 = millis();
                 while (true) {
+                    // Sleep until scan request wakes us
+                    if (g_scan_state == SCAN_SLEEP) {
+                        xSemaphoreTake(g_scan_wake_sem, portMAX_DELAY);
+                        // Woken — initialize scan state
+                        g_scan_start_ms = millis();
+                        g_scan_frame_count = 0;
+                        g_stable_count = 0;
+                        memset(&g_best_detection, 0, sizeof(g_best_detection));
+                        g_best_prob = -1.0f;
+                        g_track.active = false;
+                        g_initial_sent = false;
+                        g_last_sent_confidence = -1.0f;
+                        g_last_sent_yaw = 0;
+                        g_last_sent_color = 0;
+                        g_scan_retries = 0;
+                        Serial.printf("[SCAN] Woken for task=%d\n", g_scan_task_id);
+                    }
+
+                    // Handle mid-scan restart (set by ESP-NOW callback)
+                    if (g_scan_restart) {
+                        g_scan_restart = false;
+                        g_scan_start_ms = millis();
+                        g_scan_frame_count = 0;
+                        g_stable_count = 0;
+                        g_scan_retries = 0;
+                        memset(&g_best_detection, 0, sizeof(g_best_detection));
+                        g_best_prob = -1.0f;
+                        g_track.active = false;
+                        g_initial_sent = false;
+                        g_last_sent_confidence = -1.0f;
+                        g_last_sent_yaw = 0;
+                        g_last_sent_color = 0;
+                        Serial.printf("[SCAN] Restarted for task=%d\n", g_scan_task_id);
+                    }
+
                     process_qr_frame();
+
                     fps_count++;
                     uint32_t now = millis();
                     if (now - fps_t0 >= 2000) {

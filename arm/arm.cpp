@@ -3,27 +3,31 @@
 // Callback only enqueues; loop() dispatches — never block in callback.
 // WiFi reconnect is throttled; I2C errors logged.
 
-#include <Arduino.h>
-#include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
-#include <math.h>
+#include <Arduino.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <math.h>
 
-// ================= TYPES (must be before all functions for PlatformIO ino2cpp) =================
-struct JointAngles { int t1, t2, t3, t4; bool reachable; };
+// ================= TYPES (must be before all functions for PlatformIO ino2cpp)
+// =================
+struct JointAngles {
+  int t1, t2, t3, t4;
+  bool reachable;
+};
 
 // ================= COMMAND QUEUE (ring buffer) =================
 // SPSC: writer = WiFi task (OnDataRecv), reader = loop().
 // Uses portMUX spinlock for cross-core memory visibility on ESP32 dual-core.
 #define CMD_Q_DEPTH 8
-static char    cmdQueue[CMD_Q_DEPTH][10];
-static uint8_t cmdQHead = 0;  // written by WiFi task (core 0)
-static uint8_t cmdQTail = 0;  // written by loop (core 1)
+static char cmdQueue[CMD_Q_DEPTH][10];
+static uint8_t cmdQHead = 0; // written by WiFi task (core 0)
+static uint8_t cmdQTail = 0; // written by loop (core 1)
 static portMUX_TYPE cmdMux = portMUX_INITIALIZER_UNLOCKED;
 
-static bool enqueueCmd(const char* cmd) {
+static bool enqueueCmd(const char *cmd) {
   portENTER_CRITICAL_ISR(&cmdMux);
   uint8_t next = (cmdQHead + 1) % CMD_Q_DEPTH;
   if (next == cmdQTail) {
@@ -37,7 +41,7 @@ static bool enqueueCmd(const char* cmd) {
   return true;
 }
 
-static bool dequeueCmd(char* out) {
+static bool dequeueCmd(char *out) {
   portENTER_CRITICAL(&cmdMux);
   if (cmdQHead == cmdQTail) {
     portEXIT_CRITICAL(&cmdMux);
@@ -56,16 +60,16 @@ typedef struct {
 } ArmCommand;
 
 typedef struct __attribute__((packed)) {
-  uint8_t type;       // 0=status
-  uint8_t busy;       // 1=busy, 0=idle
+  uint8_t type; // 0=status
+  uint8_t busy; // 1=busy, 0=idle
   uint8_t pad[2];
 } ArmStatus;
 
 // Camera pose data forwarded by base via ESP-NOW
 struct __attribute__((packed)) CameraPoseData {
-  uint8_t type;        // 1 = camera pose packet
+  uint8_t type; // 1 = camera pose packet
   uint8_t pose_valid;
-  uint8_t color;       // 0=unknown, 1=R, 2=G, 3=B
+  uint8_t color; // 0=unknown, 1=R, 2=G, 3=B
   uint8_t estimated;
   float tx_mm;
   float ty_mm;
@@ -85,25 +89,25 @@ static volatile uint32_t espnowTxOk = 0, espnowTxFail = 0;
 
 // ================= PCA9685 =================
 Adafruit_PWMServoDriver driver = Adafruit_PWMServoDriver();
-#define NUM_SERVOS  5
-#define SERVOMIN   125
-#define SERVOMAX   550
-#define SERVO_FREQ  50
+#define NUM_SERVOS 5
+#define SERVOMIN 125
+#define SERVOMAX 550
+#define SERVO_FREQ 50
 
 // ================= SERVO SETTINGS =================
-const float GRIP_OPEN  = 30.0;
+const float GRIP_OPEN = 30.0;
 const float GRIP_CLOSE = 160.0;
 const float MS_PER_DEGREE = 10.0f;
-const long  MIN_MOVE_DURATION = 300;
+const long MIN_MOVE_DURATION = 300;
 
 // ================= WAYPOINTS =================
-float posGreen[4]  = {0,  100, 55, -100};
-float posBlue[4]   = {-90, 50, 55, -100};
-float posRed[4]    = {90, 50, 55, -100};
-float posRod[4]    = {0,  260, 200, 0};
+float posGreen[4] = {0, 100, 55, -100};
+float posBlue[4] = {-100, 50, 55, -100}; // first number was -90
+float posRed[4] = {100, 50, 55, -100};   // first number was 90
+float posRod[4] = {0, 260, 200, 0};
 float dropGreen[4] = {0, 235, 0, -90};
-float dropBlue[4]  = {0, 235, 0, -90};
-float dropRed[4]   = {-235, 0, 0, -90};
+float dropBlue[4] = {0, 235, 0, -90};
+float dropRed[4] = {-235, 0, 0, -90};
 
 // ================= GLOBAL STATE =================
 float currentAngle[NUM_SERVOS] = {90, 170, 180, 100, GRIP_OPEN};
@@ -121,8 +125,10 @@ int angleToPulse(float angle) {
 void executeSyncMove();
 
 void moveServo(int servoIndex, float angle) {
-  if (servoIndex < 0 || servoIndex >= NUM_SERVOS) return;
-  for (int i = 0; i < NUM_SERVOS; i++) targetAngles[i] = currentAngle[i];
+  if (servoIndex < 0 || servoIndex >= NUM_SERVOS)
+    return;
+  for (int i = 0; i < NUM_SERVOS; i++)
+    targetAngles[i] = currentAngle[i];
   targetAngles[servoIndex] = angle;
   executeSyncMove();
 }
@@ -132,16 +138,22 @@ JointAngles calculateIK(float x, float y, float z, float phi_deg) {
   JointAngles angles;
   float phi = phi_deg * PI / 180.0;
   angles.t1 = round(atan2(y, x) * 180.0 / PI);
-  float R  = sqrtf(x*x + y*y);
+  float R = sqrtf(x * x + y * y);
   float Rw = R - L5 * cosf(phi);
   float Zw = z - L1 - L5 * sinf(phi);
-  float R_up = sqrtf(L2*L2 + L3*L3);
-  float d_sq = Rw*Rw + Zw*Zw;
-  float cos_q3 = (d_sq - R_up*R_up - L4*L4) / (2.0f * R_up * L4);
-  if (cos_q3 < -1.0f || cos_q3 > 1.0f) { angles.reachable = false; return angles; }
+  float R_up = sqrtf(L2 * L2 + L3 * L3);
+  float d_sq = Rw * Rw + Zw * Zw;
+  float cos_q3 = (d_sq - R_up * R_up - L4 * L4) / (2.0f * R_up * L4);
+  if (cos_q3 < -1.0f || cos_q3 > 1.0f) {
+    angles.reachable = false;
+    return angles;
+  }
   float q3 = acosf(cos_q3);
   float denom = R_up + L4 * cosf(q3);
-  if (fabsf(denom) < 0.1f)          { angles.reachable = false; return angles; }
+  if (fabsf(denom) < 0.1f) {
+    angles.reachable = false;
+    return angles;
+  }
   float q2 = atan2f(Zw, Rw) + atan2f(L4 * sinf(q3), denom);
   float d1 = atan2f(L3, L2);
   angles.t2 = round((q2 + d1) * (180.0 / PI));
@@ -160,7 +172,8 @@ JointAngles calculateIK(float x, float y, float z, float phi_deg) {
 bool moveRobot(float x, float y, float z, float pitch, int gripState) {
   JointAngles ik = calculateIK(x, y, z, pitch);
   if (!ik.reachable) {
-    Serial.printf("[ARM] IK unreachable: (%.0f,%.0f,%.0f) phi=%.0f\n", x, y, z, pitch);
+    Serial.printf("[ARM] IK unreachable: (%.0f,%.0f,%.0f) phi=%.0f\n", x, y, z,
+                  pitch);
     return false;
   }
   targetAngles[0] = ik.t1;
@@ -173,23 +186,22 @@ bool moveRobot(float x, float y, float z, float pitch, int gripState) {
   return true;
 }
 
-void goHome()   { moveRobot(0, 90, 150, -20, 0); }
+void goHome() { moveRobot(0, 90, 150, -20, 0); }
 void scanPose() { moveRobot(0, 150, 200, -45, 0); }
 
 // ================= CAMERA-TO-LINK4 TRANSFORM =================
 // Fixed extrinsics: camera frame -> link4 end effector frame
-static const float T_CAM_TO_L4[4][4] = {
-    { 0.0f,  0.0f,  1.0f,  -5.9f    },
-    { 0.0f, -1.0f,  0.0f,   6.35f   },
-    { 1.0f,  0.0f,  0.0f,   0.0f    },
-    { 0.0f,  0.0f,  0.0f,   1.0f    }
-};
+static const float T_CAM_TO_L4[4][4] = {{0.0f, 0.0f, 1.0f, -5.9f},
+                                        {0.0f, -1.0f, 0.0f, 6.35f},
+                                        {1.0f, 0.0f, 0.0f, 0.0f},
+                                        {0.0f, 0.0f, 0.0f, 1.0f}};
 
 // ================= FORWARD KINEMATICS =================
-// Given joint angles t1..t4, compute link4 end effector pose (x,y,z,phi) in arm base frame.
-static void forwardKinematics(float t1, float t2, float t3, float t4,
-                               float &x, float &y, float &z, float &phi_deg) {
-  float d1  = atan2f(L3, L2);
+// Given joint angles t1..t4, compute link4 end effector pose (x,y,z,phi) in arm
+// base frame.
+static void forwardKinematics(float t1, float t2, float t3, float t4, float &x,
+                              float &y, float &z, float &phi_deg) {
+  float d1 = atan2f(L3, L2);
   float t1r = t1 * PI / 180.0f;
   float t2r = t2 * PI / 180.0f;
   float t3r = t3 * PI / 180.0f;
@@ -198,9 +210,9 @@ static void forwardKinematics(float t1, float t2, float t3, float t4,
   float q2 = t2r - d1;
   float q3 = t3r - d1;
 
-  float phi = q2 - q3 + (PI/2.0f - t4r);
+  float phi = q2 - q3 + (PI / 2.0f - t4r);
 
-  float R_up = sqrtf(L2*L2 + L3*L3);
+  float R_up = sqrtf(L2 * L2 + L3 * L3);
 
   float R_elbow = R_up * cosf(q2);
   float Z_elbow = L1 + R_up * sinf(q2);
@@ -219,22 +231,21 @@ static void forwardKinematics(float t1, float t2, float t3, float t4,
 
 // ================= CAMERA-FRAME -> ARM-BASE-FRAME =================
 static void cameraToBase(float tx_cam, float ty_cam, float tz_cam,
-                          float &x_base, float &y_base, float &z_base) {
+                         float &x_base, float &y_base, float &z_base) {
   float l4x, l4y, l4z, l4phi;
-  forwardKinematics(currentAngle[0], currentAngle[1],
-                    currentAngle[2], currentAngle[3],
-                    l4x, l4y, l4z, l4phi);
+  forwardKinematics(currentAngle[0], currentAngle[1], currentAngle[2],
+                    currentAngle[3], l4x, l4y, l4z, l4phi);
 
-  float dx = T_CAM_TO_L4[0][0]*tx_cam + T_CAM_TO_L4[0][1]*ty_cam +
-             T_CAM_TO_L4[0][2]*tz_cam + T_CAM_TO_L4[0][3];
-  float dy = T_CAM_TO_L4[1][0]*tx_cam + T_CAM_TO_L4[1][1]*ty_cam +
-             T_CAM_TO_L4[1][2]*tz_cam + T_CAM_TO_L4[1][3];
-  float dz = T_CAM_TO_L4[2][0]*tx_cam + T_CAM_TO_L4[2][1]*ty_cam +
-             T_CAM_TO_L4[2][2]*tz_cam + T_CAM_TO_L4[2][3];
+  float dx = T_CAM_TO_L4[0][0] * tx_cam + T_CAM_TO_L4[0][1] * ty_cam +
+             T_CAM_TO_L4[0][2] * tz_cam + T_CAM_TO_L4[0][3];
+  float dy = T_CAM_TO_L4[1][0] * tx_cam + T_CAM_TO_L4[1][1] * ty_cam +
+             T_CAM_TO_L4[1][2] * tz_cam + T_CAM_TO_L4[1][3];
+  float dz = T_CAM_TO_L4[2][0] * tx_cam + T_CAM_TO_L4[2][1] * ty_cam +
+             T_CAM_TO_L4[2][2] * tz_cam + T_CAM_TO_L4[2][3];
 
   float t1r = currentAngle[0] * PI / 180.0f;
-  x_base = l4x + dx*cosf(t1r) - dy*sinf(t1r);
-  y_base = l4y + dx*sinf(t1r) + dy*cosf(t1r);
+  x_base = l4x + dx * cosf(t1r) - dy * sinf(t1r);
+  y_base = l4y + dx * sinf(t1r) + dy * cosf(t1r);
   z_base = l4z + dz;
 }
 
@@ -245,7 +256,8 @@ void RedToCar();
 
 // ================= CAMERA-GUIDED PICKUP =================
 // Called from loop() when camera pose data arrives via ESP-NOW.
-// Transforms QR from camera frame -> arm base frame -> IK -> grip -> color place.
+// Transforms QR from camera frame -> arm base frame -> IK -> grip -> color
+// place.
 static void cameraGuidedPickup() {
   CameraPoseData *p = &incomingCameraPose;
 
@@ -254,16 +266,19 @@ static void cameraGuidedPickup() {
     return;
   }
 
+  // Move home first so currentAngle[] is known for cameraToBase FK
+  goHome();
+
   Serial.printf("[CAM] Guided pickup: color=%d conf=%.2f "
                 "qr=(%.0f,%.0f,%.0f) yaw=%.1f\n",
-                p->color, p->confidence,
-                p->tx_mm, p->ty_mm, p->tz_mm, p->yaw_deg);
+                p->color, p->confidence, p->tx_mm, p->ty_mm, p->tz_mm,
+                p->yaw_deg);
 
   // 1. Convert QR position from camera frame -> arm base frame
   float x_qr, y_qr, z_qr;
   cameraToBase(p->tx_mm, p->ty_mm, p->tz_mm, x_qr, y_qr, z_qr);
-  Serial.printf("[CAM] QR in base frame: (%.0f, %.0f, %.0f)\n",
-                x_qr, y_qr, z_qr);
+  Serial.printf("[CAM] QR in base frame: (%.0f, %.0f, %.0f)\n", x_qr, y_qr,
+                z_qr);
 
   // 2. Approach: move 40mm above QR with gripper open
   if (!moveRobot(x_qr, y_qr, z_qr + 40, -90, 0)) {
@@ -295,13 +310,22 @@ static void cameraGuidedPickup() {
 
   // 7. Place based on color
   switch (p->color) {
-    case 1: Serial.println("[CAM] -> RedToCar"); RedToCar();   break;
-    case 2: Serial.println("[CAM] -> GreenToCar"); GreenToCar(); break;
-    case 3: Serial.println("[CAM] -> BlueToCar"); BlueToCar();  break;
-    default:
-      Serial.printf("[CAM] Unknown color %d, going home\n", p->color);
-      goHome();
-      break;
+  case 1:
+    Serial.println("[CAM] -> RedToCar");
+    RedToCar();
+    break;
+  case 2:
+    Serial.println("[CAM] -> GreenToCar");
+    GreenToCar();
+    break;
+  case 3:
+    Serial.println("[CAM] -> BlueToCar");
+    BlueToCar();
+    break;
+  default:
+    Serial.printf("[CAM] Unknown color %d, going home\n", p->color);
+    goHome();
+    break;
   }
 
   Serial.println("[CAM] Camera-guided pickup complete");
@@ -317,16 +341,19 @@ void executeSyncMove() {
   for (int i = 0; i < NUM_SERVOS; i++) {
     startAngles[i] = currentAngle[i];
     float delta = fabsf(targetAngles[i] - currentAngle[i]);
-    if (delta > maxDelta) maxDelta = delta;
+    if (delta > maxDelta)
+      maxDelta = delta;
   }
   long duration = (long)(maxDelta * MS_PER_DEGREE);
-  if (duration < MIN_MOVE_DURATION) duration = MIN_MOVE_DURATION;
+  if (duration < MIN_MOVE_DURATION)
+    duration = MIN_MOVE_DURATION;
 
   while (true) {
     unsigned long elapsed = millis() - startTime;
-    if (elapsed >= (unsigned long)duration) break;
+    if (elapsed >= (unsigned long)duration)
+      break;
 
-    float progress  = (float)elapsed / (float)duration;
+    float progress = (float)elapsed / (float)duration;
     float smoothStep = (1.0f - cosf(progress * PI)) / 2.0f;
 
     for (int i = 0; i < NUM_SERVOS; i++) {
@@ -334,7 +361,7 @@ void executeSyncMove() {
       currentAngle[i] = startAngles[i] + (travel * smoothStep);
       driver.setPWM(i, 0, angleToPulse(currentAngle[i]));
     }
-    delay(10);   // yields to FreeRTOS — WiFi task runs, queue fills
+    delay(10); // yields to FreeRTOS — WiFi task runs, queue fills
   }
 
   for (int i = 0; i < NUM_SERVOS; i++) {
@@ -354,14 +381,16 @@ void stepServo(int idx, int dir) {
   if (idx == 4) {
     // Claw toggle — just hold or release
     float target = (currentAngle[4] > (GRIP_OPEN + GRIP_CLOSE) / 2.0f)
-                  ? GRIP_OPEN : GRIP_CLOSE;
+                       ? GRIP_OPEN
+                       : GRIP_CLOSE;
     Serial.printf("[ARM] Claw toggle: %.0f -> %.0f\n", currentAngle[4], target);
     moveServo(4, target);
     return;
   }
   float newAng = currentAngle[idx] + (float)dir;
   newAng = constrain(newAng, 0.0f, 180.0f);
-  Serial.printf("[ARM] stepServo S%d: %.0f -> %.0f (dir=%d)\n", idx+1, currentAngle[idx], newAng, dir);
+  Serial.printf("[ARM] stepServo S%d: %.0f -> %.0f (dir=%d)\n", idx + 1,
+                currentAngle[idx], newAng, dir);
   moveServo(idx, newAng);
 }
 
@@ -371,73 +400,73 @@ void stepServo(int idx, int dir) {
 // delay(200) after gripper close gives the physical gripper time to seat.
 
 void GreenToFloor() {
-  moveRobot(posGreen[0], posGreen[1], posGreen[2]+40, posGreen[3], 0);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2],      posGreen[3], 0);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2],      posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 1);
   delay(200);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2]+40,  posGreen[3], 1);
-  moveRobot(dropGreen[0], dropGreen[1], dropGreen[2],    dropGreen[3], 1);
-  moveRobot(dropGreen[0], dropGreen[1], dropGreen[2],    dropGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 1);
+  moveRobot(dropGreen[0], dropGreen[1], dropGreen[2], dropGreen[3], 1);
+  moveRobot(dropGreen[0], dropGreen[1], dropGreen[2], dropGreen[3], 0);
   delay(200);
   goHome();
 }
 
 void BlueToFloor() {
-  moveRobot(posBlue[0], posBlue[1], posBlue[2]+40, posBlue[3], 0);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2],      posBlue[3], 0);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2],      posBlue[3], 1);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 0);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2], posBlue[3], 0);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2], posBlue[3], 1);
   delay(200);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2]+40,  posBlue[3], 1);
-  moveRobot(dropBlue[0], dropBlue[1], dropBlue[2],   dropBlue[3], 1);
-  moveRobot(dropBlue[0], dropBlue[1], dropBlue[2],   dropBlue[3], 0);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 1);
+  moveRobot(dropBlue[0], dropBlue[1], dropBlue[2], dropBlue[3], 1);
+  moveRobot(dropBlue[0], dropBlue[1], dropBlue[2], dropBlue[3], 0);
   delay(200);
   goHome();
 }
 
 void RedToFloor() {
-  moveRobot(posRed[0], posRed[1], posRed[2]+40, posRed[3], 0);
-  moveRobot(posRed[0], posRed[1], posRed[2],      posRed[3], 0);
-  moveRobot(posRed[0], posRed[1], posRed[2],      posRed[3], 1);
+  moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 0);
+  moveRobot(posRed[0], posRed[1], posRed[2], posRed[3], 0);
+  moveRobot(posRed[0], posRed[1], posRed[2], posRed[3], 1);
   delay(200);
-  moveRobot(posRed[0], posRed[1], posRed[2]+40,  posRed[3], 1);
-  moveRobot(dropRed[0], dropRed[1], dropRed[2],   dropRed[3], 1);
-  moveRobot(dropRed[0], dropRed[1], dropRed[2],   dropRed[3], 0);
+  moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 1);
+  moveRobot(dropRed[0], dropRed[1], dropRed[2], dropRed[3], 1);
+  moveRobot(dropRed[0], dropRed[1], dropRed[2], dropRed[3], 0);
   delay(200);
   goHome();
 }
 
 void GreenToCar() {
-  moveRobot(posRod[0], posRod[1], posRod[2],      posRod[3], 1);
-  moveRobot(posRod[0], posRod[1], posRod[2]+40,  posRod[3], 1);
-  moveRobot(posRod[0], posRod[1]-60, posRod[2]+40, posRod[3], 1);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2]+40, posGreen[3], 1);
-  moveRobot(posGreen[0], posGreen[1]+20, posGreen[2], posGreen[3], 1);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2],      posGreen[3], 0);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2]+40,  posGreen[3], 0);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
+  moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1] + 20, posGreen[2], posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 0);
   delay(200);
   goHome();
 }
 
 void BlueToCar() {
-  moveRobot(posRod[0], posRod[1], posRod[2],      posRod[3], 1);
-  moveRobot(posRod[0], posRod[1], posRod[2]+40,  posRod[3], 1);
-  moveRobot(posRod[0], posRod[1]-60, posRod[2]+40, posRod[3], 1);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2]+40,  posBlue[3], 1);
-  moveRobot(posBlue[0]-20, posBlue[1]+20, posBlue[2], posBlue[3], 1);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2],      posBlue[3], 0);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2]+40,  posBlue[3], 0);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
+  moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 1);
+  moveRobot(posBlue[0] - 20, posBlue[1] + 20, posBlue[2], posBlue[3], 1);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2], posBlue[3], 0);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 0);
   delay(200);
   goHome();
 }
 
 void RedToCar() {
-  moveRobot(posRod[0], posRod[1], posRod[2],      posRod[3], 1);
-  moveRobot(posRod[0], posRod[1], posRod[2]+40,  posRod[3], 1);
-  moveRobot(posRod[0], posRod[1]-60, posRod[2]+40, posRod[3], 1);
-  moveRobot(posRed[0], posRed[1], posRed[2]+40,  posRed[3], 1);
-  moveRobot(posRed[0]+20, posRed[1]+20, posRed[2], posRed[3], 1);
-  moveRobot(posRed[0], posRed[1], posRed[2],      posRed[3], 0);
-  moveRobot(posRed[0], posRed[1], posRed[2]+40,  posRed[3], 0);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
+  moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
+  moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 1);
+  moveRobot(posRed[0] + 20, posRed[1] + 20, posRed[2], posRed[3], 1);
+  moveRobot(posRed[0], posRed[1], posRed[2], posRed[3], 0);
+  moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 0);
   delay(200);
   goHome();
 }
@@ -448,11 +477,12 @@ void RedToCar() {
 void CarToPlatform() {
   Serial.println("[ACTION] Car To Platform — approach");
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0);
-  moveRobot(posRod[0], posRod[1], posRod[2],       posRod[3], 0);
+  moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
   Serial.println("[ACTION] At car — use step buttons to adjust, then grip");
 }
 
-// ================= DISPATCH (called from loop, NEVER from callback) =================
+// ================= DISPATCH (called from loop, NEVER from callback)
+// =================
 static void sendArmStatus(bool busy) {
   ArmStatus st = {};
   st.type = 0;
@@ -463,30 +493,39 @@ static void sendArmStatus(bool busy) {
   }
 }
 
-static void dispatchCmd(const char* cmd) {
-  if      (strcmp(cmd, "GTC") == 0)  GreenToCar();
-  else if (strcmp(cmd, "BTC") == 0)  BlueToCar();
-  else if (strcmp(cmd, "RTC") == 0)  RedToCar();
-  else if (strcmp(cmd, "GTF") == 0)  GreenToFloor();
-  else if (strcmp(cmd, "BTF") == 0)  BlueToFloor();
-  else if (strcmp(cmd, "RTF") == 0)  RedToFloor();
-  else if (strcmp(cmd, "CTP") == 0)  CarToPlatform();
-  else if (strcmp(cmd, "H")   == 0)  goHome();
-  else if (strcmp(cmd, "S")   == 0)  scanPose();
+static void dispatchCmd(const char *cmd) {
+  if (strcmp(cmd, "GTC") == 0)
+    GreenToCar();
+  else if (strcmp(cmd, "BTC") == 0)
+    BlueToCar();
+  else if (strcmp(cmd, "RTC") == 0)
+    RedToCar();
+  else if (strcmp(cmd, "GTF") == 0)
+    GreenToFloor();
+  else if (strcmp(cmd, "BTF") == 0)
+    BlueToFloor();
+  else if (strcmp(cmd, "RTF") == 0)
+    RedToFloor();
+  else if (strcmp(cmd, "CTP") == 0)
+    CarToPlatform();
+  else if (strcmp(cmd, "H") == 0)
+    goHome();
+  else if (strcmp(cmd, "S") == 0)
+    scanPose();
   else if (strncmp(cmd, "SV:", 3) == 0) {
     int idx = -1, dir = 0;
     if (sscanf(cmd, "SV:%d:%d", &idx, &dir) == 2)
       stepServo(idx, dir);
-  }
-  else Serial.printf("[ARM] Unknown: %s\n", cmd);
+  } else
+    Serial.printf("[ARM] Unknown: %s\n", cmd);
 }
 
 // ================= ESP-NOW RECEIVE CALLBACK =================
 // Runs in the WiFi task — MUST return immediately.
-void OnDataRecv(const uint8_t *mac_addr,
-                const uint8_t *incomingData,
+void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData,
                 int len) {
-  if (!incomingData || len < 1) return;
+  if (!incomingData || len < 1)
+    return;
   // Camera pose packet (24 bytes, type=1)
   if (len == (int)sizeof(CameraPoseData)) {
     CameraPoseData pose;
@@ -496,14 +535,15 @@ void OnDataRecv(const uint8_t *mac_addr,
       cameraPoseReady = true;
       Serial.printf("[ARM] Camera pose received: color=%d conf=%.2f "
                     "qr=(%.0f,%.0f,%.0f)\n",
-                    pose.color, pose.confidence,
-                    pose.tx_mm, pose.ty_mm, pose.tz_mm);
+                    pose.color, pose.confidence, pose.tx_mm, pose.ty_mm,
+                    pose.tz_mm);
     }
     return;
   }
 
   // Arm command (10 bytes)
-  if (len != (int)sizeof(ArmCommand)) return;
+  if (len != (int)sizeof(ArmCommand))
+    return;
 
   ArmCommand msg;
   memcpy(&msg, incomingData, sizeof(msg));
@@ -530,9 +570,9 @@ static void checkWifi() {
     esp_now_del_peer(baseAddress);
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, baseAddress, 6);
-    peerInfo.channel = 11;  // Must match Base AP WIFI_CHANNEL
+    peerInfo.channel = 11; // Must match Base AP WIFI_CHANNEL
     peerInfo.encrypt = false;
-    peerInfo.ifidx   = WIFI_IF_STA;
+    peerInfo.ifidx = WIFI_IF_STA;
     if (esp_now_add_peer(&peerInfo) != ESP_OK) {
       Serial.println("[ESP-NOW] Failed to re-add base peer after reconnect");
     } else {
@@ -541,8 +581,10 @@ static void checkWifi() {
   }
   wasWifiConnected = isConnected;
 
-  if (isConnected) return;
-  if (millis() - lastWifiAttempt < 5000) return;
+  if (isConnected)
+    return;
+  if (millis() - lastWifiAttempt < 5000)
+    return;
   lastWifiAttempt = millis();
   Serial.println("[ARM] WiFi down, reconnecting...");
   WiFi.disconnect();
@@ -578,26 +620,28 @@ void setup() {
   }
   esp_wifi_set_ps(WIFI_PS_NONE);
 
-  Serial.printf("[ARM] MAC: %s  WiFi: %s  ch=%d\n",
-    WiFi.macAddress().c_str(),
-    (WiFi.status() == WL_CONNECTED) ? "OK" : "DOWN",
-    WiFi.channel());
+  Serial.printf("[ARM] MAC: %s  WiFi: %s  ch=%d\n", WiFi.macAddress().c_str(),
+                (WiFi.status() == WL_CONNECTED) ? "OK" : "DOWN",
+                WiFi.channel());
 
   // ESP-NOW init (must come after WiFi.mode)
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(OnDataRecv);
 
     // Track ESP-NOW send delivery
-    esp_now_register_send_cb([](const uint8_t *, esp_now_send_status_t status) {
-      if (status == ESP_NOW_SEND_SUCCESS) espnowTxOk++;
-      else espnowTxFail++;
-    });
+    esp_now_register_send_cb(
+        [](const uint8_t *mac_addr, esp_now_send_status_t status) {
+          if (status == ESP_NOW_SEND_SUCCESS)
+            espnowTxOk++;
+          else
+            espnowTxFail++;
+        });
 
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, baseAddress, 6);
     peerInfo.channel = 11;
     peerInfo.encrypt = false;
-    peerInfo.ifidx   = WIFI_IF_STA;
+    peerInfo.ifidx = WIFI_IF_STA;
 
     if (esp_now_add_peer(&peerInfo) != ESP_OK)
       Serial.println("[ESP-NOW] Failed to add base peer");
@@ -619,7 +663,7 @@ void loop() {
   static bool homed = false;
   if (!homed) {
     homed = true;
-    goHome();  // Move to home position (matches Blynk config)
+    goHome(); // Move to home position (matches Blynk config)
   }
 
   checkWifi();
@@ -640,7 +684,8 @@ void loop() {
   bool didWork = false;
   for (int i = 0; i < 4; i++) {
     char cmd[10];
-    if (!dequeueCmd(cmd)) break;
+    if (!dequeueCmd(cmd))
+      break;
     if (!didWork) {
       sendArmStatus(true);
       didWork = true;

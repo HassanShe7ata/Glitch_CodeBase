@@ -7,6 +7,7 @@
 #include <math.h>
 #include <Wire.h>
 #include <esp_now.h>
+#include "MPU6050_6Axis_MotionApps20.h"
 
 // ================= WIFI AP =================
 const char* AP_SSID = "GLITCH";
@@ -64,6 +65,7 @@ struct __attribute__((packed)) PoseReply {
   float tz_mm;
   float yaw_deg;
   float confidence;
+  uint8_t status;      // 0=Accumulating, 1=DONE
 };
 
 // ESP-NOW packet: Base → Arm (camera pose data for guided IK)
@@ -101,6 +103,12 @@ static volatile uint32_t espNowRecvMatchPose = 0;
 static volatile uint32_t espNowRecvMatchArm = 0;
 static volatile uint32_t espNowRecvNoMatch = 0;
 
+// Scan progress tracking
+static volatile bool scanInProgress = false;
+static volatile uint8_t lastScanStatus = 0;  // 0=Accumulating, 1=DONE
+static unsigned long scanStartMs = 0;
+static portMUX_TYPE camMux = portMUX_INITIALIZER_UNLOCKED;
+
 // Last QR scan result (persists until new scan)
 static bool lastQrValid = false;
 static uint8_t lastQrColor = 0;
@@ -110,6 +118,13 @@ static bool newQrResult = false;
 // --- STEP MOVEMENT FLAG ---
 bool pendingStep = false;
 String stepArg = "";
+
+// --- CONTINUOUS MOVEMENT STATE ---
+bool moveActive = false;
+const int8_t *moveVec = nullptr;
+int8_t moveSpeed = 0;
+float moveTargetHeading = 0;
+bool moveIsRotation = false;
 
 // --- I2C Registers ---
 #define I2C_ADDR 0x34
@@ -125,16 +140,28 @@ String stepArg = "";
 bool autonomousMode = false;
 bool autoTrigger = 0;
 
-// --- CALIBRATED TICK CONSTANTS (WEIGHT-AWARE) ---
-const float TICKS_FWD_BWD = 5540.0;
-const float TICKS_STRAFE = 6253.0;
-const float TICKS_DIAG = 7875.0;
-const float TICKS_ROTATE = 7200.0;
+// --- MPU6050 DMP ---
+MPU6050 mpu;
+bool dmpReady = false;
+uint8_t fifoBuffer[64];
+Quaternion q;
+VectorFloat gravity;
+float ypr[3];
+float currentYaw = 0;
+float targetHeading = 0;
+void updateYaw();
+
+// --- CALIBRATED TICK CONSTANTS (WEIGHT-AWARE × 97/80) ---
+const float TICKS_FWD_BWD = 6717.25f;
+const float TICKS_STRAFE = 7581.71f;
+const float TICKS_DIAG = 9548.44f;
+const float TICKS_ROTATE = 8730.00f;
 
 int8_t Motor_speed = 25;
 
 // --- STABILITY CONTROL ---
 const float KP_POS = 0.005;
+const float KP_GYRO = 2.5;
 const int8_t MIN_TORQUE = 18;
 const int16_t FINAL_TOLERANCE = 100;
 const long BRAKE_ZONE_TICKS = 1500;
@@ -162,6 +189,7 @@ static float servoAngle[4] = {90.0f, 170.0f, 180.0f, 100.0f};
 // ESP NOW FUNCTIONS
 // ================================================================
 
+// ESP-NOW send callback
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   Serial.print("ESP-NOW Send Status: ");
   if (status == ESP_NOW_SEND_SUCCESS)
@@ -171,6 +199,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 }
 
 // ESP-NOW receive callback — JUST STORE DATA, no heavy operations
+// Runs in WiFi task — MUST return immediately.
 void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (!mac || !data || len < 1) return;
   bool fromArm = (memcmp(mac, armAddress, 6) == 0);
@@ -180,8 +209,12 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
   espNowRecvCount++;
   espNowRecvBytes += len;
   if (fromCam && len == (int)sizeof(PoseReply) && data[0] == ESPNOW_TYPE_POSE_REPLY) {
+    portENTER_CRITICAL(&camMux);
     memcpy((void *)&lastPoseReply, data, sizeof(PoseReply));
+    portEXIT_CRITICAL(&camMux);
     cameraPoseReceived = true;
+    lastScanStatus = lastPoseReply.status;
+    if (lastPoseReply.status == 1) scanInProgress = false;
     espNowRecvMatchPose++;
   } else if (fromArm && len == (int)sizeof(ArmStatus) && data[0] == 0) {
     memcpy((void *)&lastArmStatus, data, sizeof(ArmStatus));
@@ -193,7 +226,8 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 }
 
 void sendCommandToArm(const char *cmd) {
-  strcpy(armMessage.command, cmd);
+  strncpy(armMessage.command, cmd, sizeof(armMessage.command) - 1);
+  armMessage.command[sizeof(armMessage.command) - 1] = '\0';
   esp_err_t result =
       esp_now_send(armAddress, (uint8_t *)&armMessage, sizeof(armMessage));
   Serial.print("Sending Command -> ");
@@ -211,13 +245,21 @@ void sendScanRequest(uint8_t mode) {
   req.task_id = ++taskCounter;
   req.mode = mode;
   esp_err_t result = esp_now_send(cameraAddress, (uint8_t *)&req, sizeof(req));
-  Serial.printf("[CAM] Scan request sent: task=%d mode=%d (%s)\n", req.task_id,
-                req.mode, result == ESP_OK ? "OK" : "FAILED");
+  if (result == ESP_OK) {
+    scanInProgress = true;
+    lastScanStatus = 0;
+    scanStartMs = millis();
+    Serial.printf("[CAM] Scan request sent: task=%d mode=%d\n", req.task_id, req.mode);
+  } else {
+    scanInProgress = false;
+    Serial.printf("[CAM] Scan request FAILED: task=%d mode=%d err=%d\n", req.task_id, req.mode, result);
+  }
 }
 
 void sendCameraPoseToArm() {
   CameraPoseData data = {};
   data.type = 1;
+  portENTER_CRITICAL(&camMux);
   data.pose_valid = lastPoseReply.pose_valid;
   data.color = lastPoseReply.color;
   data.estimated = lastPoseReply.estimated;
@@ -226,6 +268,7 @@ void sendCameraPoseToArm() {
   data.tz_mm = lastPoseReply.tz_mm;
   data.yaw_deg = lastPoseReply.yaw_deg;
   data.confidence = lastPoseReply.confidence;
+  portEXIT_CRITICAL(&camMux);
 
   esp_err_t result = esp_now_send(armAddress, (uint8_t *)&data, sizeof(data));
   Serial.printf("[BASE] Camera pose forwarded to arm: valid=%d color=%d "
@@ -248,6 +291,7 @@ bool writeBytes(uint8_t reg, uint8_t *data, size_t len) {
 }
 
 bool readEncoders(int32_t *data) {
+  Wire.setClock(40000);
   Wire.beginTransmission(I2C_ADDR);
   Wire.write(REG_ENCODER_TOTAL);
   if (Wire.endTransmission() != 0)
@@ -266,21 +310,33 @@ bool readEncoders(int32_t *data) {
 }
 
 bool writeSpeeds(int8_t v1, int8_t v2, int8_t v3, int8_t v4) {
+  Wire.setClock(40000);
   int8_t speeds[4] = {v1, v2, v3, v4};
   return writeBytes(REG_FIXED_SPEED, (uint8_t *)speeds, 4);
 }
 
-void manualMove(const int8_t vector[], int8_t speedVal) {
-  for (int i = 0; i < 5; i++) {
-    if (writeSpeeds(vector[0] * speedVal, vector[1] * speedVal,
-                    vector[2] * speedVal, vector[3] * speedVal)) {
-      break;
-    }
-    delay(5);
+void updateMotors() {
+  if (!moveActive) return;
+  updateYaw();
+  if (moveIsRotation) {
+    writeSpeeds(constrain((int)moveSpeed * moveVec[0], -100, 100),
+                constrain((int)moveSpeed * moveVec[1], -100, 100),
+                constrain((int)moveSpeed * moveVec[2], -100, 100),
+                constrain((int)moveSpeed * moveVec[3], -100, 100));
+  } else {
+    float yawError = moveTargetHeading - currentYaw;
+    if (yawError > 180) yawError -= 360;
+    if (yawError < -180) yawError += 360;
+    int8_t gyroCorr = (int8_t)constrain(yawError * KP_GYRO, -127.0f, 127.0f);
+    writeSpeeds(constrain((int)(moveSpeed * moveVec[0]) + gyroCorr, -100, 100),
+                constrain((int)(moveSpeed * moveVec[1]) - gyroCorr, -100, 100),
+                constrain((int)(moveSpeed * moveVec[2]) + gyroCorr, -100, 100),
+                constrain((int)(moveSpeed * moveVec[3]) - gyroCorr, -100, 100));
   }
 }
 
 void forceStop() {
+  moveActive = false;
   for (int i = 0; i < 5; i++) {
     if (writeSpeeds(0, 0, 0, 0)) {
       break;
@@ -305,6 +361,22 @@ void computeMecanumSpeeds(int8_t throttle, int8_t steering, int8_t rotation, int
 }
 
 // ================================================================
+// MPU6050 DMP
+// ================================================================
+
+void updateYaw() {
+  if (dmpReady) {
+    Wire.setClock(400000);
+    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+      mpu.dmpGetQuaternion(&q, fifoBuffer);
+      mpu.dmpGetGravity(&gravity, &q);
+      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+      currentYaw = (ypr[0] * 180.0f / M_PI);
+    }
+  }
+}
+
+// ================================================================
 // MOVEMENT LOGIC
 // ================================================================
 
@@ -312,16 +384,21 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
                     float tickConstant) {
   int32_t startEncoders[4], currentEncoders[4];
   long targetTicks = lroundf(fabs(distance * tickConstant));
-  int8_t localMinTorque = (tickConstant == TICKS_ROTATE) ? 22 : MIN_TORQUE;
+  int8_t localMinTorque = MIN_TORQUE;
   maxSpeed = max(maxSpeed, localMinTorque);
+
+  updateYaw();
+  targetHeading = currentYaw;
+
   if (!readEncoders(startEncoders))
     return;
   long error = targetTicks;
-  int8_t lastSpeed = -127;
   uint8_t loopCounter = 0;
   uint8_t i2cErrors = 0;
 
   while (true) {
+    updateYaw();
+
     if (loopCounter % 2 == 0) {
       if (readEncoders(currentEncoders)) {
         i2cErrors = 0;
@@ -350,53 +427,87 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
     if (error < FINAL_TOLERANCE)
       break;
     float calcSpeed = (float)error * KP_POS;
-    int8_t finalSpeed;
+    int8_t baseSpeed;
     if (error < BRAKE_ZONE_TICKS)
-      finalSpeed = localMinTorque;
+      baseSpeed = localMinTorque;
     else
-      finalSpeed = (int8_t)constrain(calcSpeed, localMinTorque, maxSpeed);
-    if (finalSpeed != lastSpeed) {
-      writeSpeeds(finalSpeed * vector[0], finalSpeed * vector[1],
-                  finalSpeed * vector[2], finalSpeed * vector[3]);
-      lastSpeed = finalSpeed;
-    }
+      baseSpeed = (int8_t)constrain(calcSpeed, localMinTorque, maxSpeed);
+
+    float yawError = targetHeading - currentYaw;
+    if (yawError > 180) yawError -= 360;
+    if (yawError < -180) yawError += 360;
+    int8_t gyroCorr = (int8_t)constrain(yawError * KP_GYRO, -127.0f, 127.0f);
+
+    writeSpeeds(constrain((int)(baseSpeed * vector[0]) + gyroCorr, -100, 100),
+                constrain((int)(baseSpeed * vector[1]) - gyroCorr, -100, 100),
+                constrain((int)(baseSpeed * vector[2]) + gyroCorr, -100, 100),
+                constrain((int)(baseSpeed * vector[3]) - gyroCorr, -100, 100));
+
     if (loopCounter > MOVE_TIMEOUT_ITERATIONS) {
       Serial.println("[ERR] Move timed out (blocked or stalled), aborting");
       break;
     }
-    delay(20);
+    delay(15);
   }
   forceStop();
 }
 
 void rotateDegrees(bool clockwise, float degrees, int8_t maxSpeed) {
-  const int8_t *vector = clockwise ? V_ROTATE_CW : V_ROTATE_CCW;
-  float distanceFraction = degrees / 360.0;
-  moveDistanceKp(vector, maxSpeed, distanceFraction, TICKS_ROTATE);
+  updateYaw();
+  float startHeading = currentYaw;
+  float target = clockwise ? (startHeading + degrees) : (startHeading - degrees);
+
+  while (true) {
+    updateYaw();
+    float yawError = target - currentYaw;
+    if (yawError > 180) yawError -= 360;
+    if (yawError < -180) yawError += 360;
+
+    if (fabs(yawError) < 1.0f) break;
+
+    int8_t turnSpeed = (fabs(yawError) < 20.0f) ? 20 : maxSpeed;
+    if (yawError < 0) turnSpeed = -turnSpeed;
+
+    writeSpeeds(turnSpeed * V_ROTATE_CW[0], turnSpeed * V_ROTATE_CW[1],
+                turnSpeed * V_ROTATE_CW[2], turnSpeed * V_ROTATE_CW[3]);
+    delay(10);
+  }
+  forceStop();
 }
 
 // ================================================================
 // AUTONOMOUS CAMERA ALIGNMENT
 // ================================================================
 
-static bool waitForCameraPose(unsigned long timeout_ms) {
+static bool waitForCameraPose(unsigned long timeout_ms, PoseReply *out) {
   cameraPoseReceived = false;
   sendScanRequest(0);
   unsigned long t0 = millis();
-  while (!cameraPoseReceived && millis() - t0 < timeout_ms) {
+  while (millis() - t0 < timeout_ms) {
     if (!autonomousMode)
       return false;
+    if (cameraPoseReceived) {
+      cameraPoseReceived = false;
+      PoseReply reply;
+      portENTER_CRITICAL(&camMux);
+      memcpy(&reply, (const void *)&lastPoseReply, sizeof(reply));
+      portEXIT_CRITICAL(&camMux);
+      if (reply.status == 1 && reply.pose_valid) {
+        if (out) *out = reply;
+        return true;
+      }
+      // Partial update (status=0) — keep waiting for DONE
+    }
     delay(20);
   }
-  if (!cameraPoseReceived) {
-    Serial.println("[AUTO] Camera scan timeout");
-    return false;
-  }
-  if (!lastPoseReply.pose_valid) {
-    Serial.println("[AUTO] Camera reported invalid pose");
-    return false;
-  }
-  return true;
+  Serial.println("[AUTO] Camera scan timeout");
+  return false;
+}
+
+static void alignBurst(const int8_t *vec, int8_t speed, int durationMs) {
+  writeSpeeds(vec[0] * speed, vec[1] * speed, vec[2] * speed, vec[3] * speed);
+  delay(durationMs);
+  forceStop();
 }
 
 static bool alignToQR() {
@@ -407,46 +518,43 @@ static bool alignToQR() {
   const int MAX_ALIGN_STEPS = 12;
   const int MAX_APPROACH_STEPS = 10;
 
-  if (!waitForCameraPose(5000))
+  PoseReply pose;
+  if (!waitForCameraPose(12000, &pose))
     return false;
 
   Serial.printf("[AUTO] Detected: color=%d conf=%.2f yaw=%.1f dist=%.0fmm\n",
-                lastPoseReply.color, lastPoseReply.confidence,
-                lastPoseReply.yaw_deg, lastPoseReply.tz_mm);
+                pose.color, pose.confidence,
+                pose.yaw_deg, pose.tz_mm);
 
   for (int step = 0; step < MAX_ALIGN_STEPS; step++) {
     if (!autonomousMode)
       return false;
-    if (fabs(lastPoseReply.yaw_deg) <= YAW_THRESHOLD_DEG)
+    if (fabs(pose.yaw_deg) <= YAW_THRESHOLD_DEG)
       break;
-    if (lastPoseReply.yaw_deg > 0)
-      manualMove(V_STRAFE_R, ALIGN_SPEED);
+    if (pose.yaw_deg > 0)
+      alignBurst(V_STRAFE_R, ALIGN_SPEED, 120);
     else
-      manualMove(V_STRAFE_L, ALIGN_SPEED);
-    delay(120);
-    forceStop();
-    if (!waitForCameraPose(3000))
+      alignBurst(V_STRAFE_L, ALIGN_SPEED, 120);
+    if (!waitForCameraPose(6000, &pose))
       return false;
   }
   forceStop();
-  Serial.printf("[AUTO] Yaw aligned: %.1f°\n", lastPoseReply.yaw_deg);
+  Serial.printf("[AUTO] Yaw aligned: %.1f°\n", pose.yaw_deg);
 
   for (int step = 0; step < MAX_APPROACH_STEPS; step++) {
     if (!autonomousMode)
       return false;
-    if (lastPoseReply.tz_mm <= APPROACH_DISTANCE_MM)
+    if (pose.tz_mm <= APPROACH_DISTANCE_MM)
       break;
-    manualMove(V_FORWARD, ALIGN_SPEED);
-    delay(200);
-    forceStop();
-    if (!waitForCameraPose(3000))
+    alignBurst(V_FORWARD, ALIGN_SPEED, 200);
+    if (!waitForCameraPose(6000, &pose))
       return false;
   }
   forceStop();
   Serial.printf("[AUTO] Approach complete: dist=%.0fmm conf=%.2f\n",
-                lastPoseReply.tz_mm, lastPoseReply.confidence);
+                pose.tz_mm, pose.confidence);
 
-  if (lastPoseReply.confidence < CONFIDENCE_THRESHOLD) {
+  if (pose.confidence < CONFIDENCE_THRESHOLD) {
     Serial.println("[AUTO] Low confidence, aborting pickup");
     return false;
   }
@@ -517,26 +625,29 @@ void handleCommand(const String &msg) {
         forceStop();
         return;
       }
-      if (arg == "FWD")
-        manualMove(V_FORWARD, Motor_speed);
-      else if (arg == "BACK")
-        manualMove(V_BACKWARD, Motor_speed);
-      else if (arg == "LEFT")
-        manualMove(V_STRAFE_L, Motor_speed);
-      else if (arg == "RIGHT")
-        manualMove(V_STRAFE_R, Motor_speed);
-      else if (arg == "ROTCW")
-        manualMove(V_ROTATE_CW, Motor_speed);
-      else if (arg == "ROTCCW")
-        manualMove(V_ROTATE_CCW, Motor_speed);
-      else if (arg == "DIAGFR")
-        manualMove(V_DIAG_FR, Motor_speed);
-      else if (arg == "DIAGFL")
-        manualMove(V_DIAG_FL, Motor_speed);
-      else if (arg == "DIAGBR")
-        manualMove(V_DIAG_BR, Motor_speed);
-      else if (arg == "DIAGBL")
-        manualMove(V_DIAG_BL, Motor_speed);
+      bool isRotation = (arg == "ROTCW" || arg == "ROTCCW");
+      const int8_t *vec = nullptr;
+      if (arg == "FWD")        vec = V_FORWARD;
+      else if (arg == "BACK")  vec = V_BACKWARD;
+      else if (arg == "LEFT")  vec = V_STRAFE_L;
+      else if (arg == "RIGHT") vec = V_STRAFE_R;
+      else if (arg == "ROTCW") vec = V_ROTATE_CW;
+      else if (arg == "ROTCCW") vec = V_ROTATE_CCW;
+      else if (arg == "DIAGFR") vec = V_DIAG_FR;
+      else if (arg == "DIAGFL") vec = V_DIAG_FL;
+      else if (arg == "DIAGBR") vec = V_DIAG_BR;
+      else if (arg == "DIAGBL") vec = V_DIAG_BL;
+
+      if (vec) {
+        moveVec = vec;
+        moveSpeed = Motor_speed;
+        moveIsRotation = isRotation;
+        if (!isRotation) {
+          updateYaw();
+          moveTargetHeading = currentYaw;
+        }
+        moveActive = true;
+      }
     }
   } else if (cmd == "STEP") {
     if (!autonomousMode && !pendingStep) {
@@ -592,6 +703,10 @@ void handleCommand(const String &msg) {
         newQrResult = false;
         sendScanRequest(1);
         Serial.println("[SCAN] Platform scan requested");
+      } else if (arg == "STOP") {
+        scanInProgress = false;
+        newQrResult = false;
+        Serial.println("[SCAN] Scan stopped by user");
       }
   } else if (cmd == "SERVO") {
     int idx = arg.substring(0, arg.indexOf(':')).toInt();
@@ -679,12 +794,26 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         .log .ok  { color: var(--ok); }
         .section-label { font-size: 10px; color: var(--muted); margin: 4px 0 6px; }
         .step-btn { padding: 6px 14px !important; font-size: 16px !important; font-weight: 700 !important; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+        button.scanning { animation: pulse 1.5s ease-in-out infinite; }
+        @media (orientation: landscape) and (max-height: 500px) {
+            body { padding: 8px; max-width: none; }
+            #topPanels { display: flex; gap: 8px; }
+            #topPanels > .card { flex: 1; margin-bottom: 0; }
+            #topPanels .log { max-height: 80px; }
+            #controlPanels { display: flex; flex-wrap: wrap; gap: 8px; }
+            #controlPanels > .card { flex: 1 1 45%; margin-bottom: 0; min-width: 200px; }
+            .pad { aspect-ratio: 1.2; }
+            .pad button { font-size: 22px; }
+            button { padding: 10px 6px; font-size: 13px; }
+        }
     </style>
 </head>
 <body>
     <h1>Glitch</h1>
     <div class="sub" id="connStatus"><span class="dot"></span><span>connecting…</span></div>
 
+    <div id="controlPanels">
     <div class="card">
         <h2>Drive</h2>
         <div class="pad">
@@ -712,13 +841,13 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
     <div class="card">
         <h2>Arm Commands</h2>
         <div class="grid-2">
-            <button data-cmd="ARM" data-arg="GTF">Green &rarr; Floor</button>
+            <button data-cmd="ARM" data-arg="GTP">Green &rarr; Platform</button>
             <button data-cmd="ARM" data-arg="BTC">Blue &rarr; Car</button>
             <button data-cmd="ARM" data-arg="RTC">Red &rarr; Car</button>
             <button data-cmd="ARM" data-arg="GTC">Green &rarr; Car</button>
             <button data-cmd="ARM" data-arg="HOME" class="danger">Home</button>
-            <button data-cmd="ARM" data-arg="RTF">Red &rarr; Floor</button>
-            <button data-cmd="ARM" data-arg="BTF">Blue &rarr; Floor</button>
+            <button data-cmd="ARM" data-arg="RTP">Red &rarr; Platform</button>
+            <button data-cmd="ARM" data-arg="BTP">Blue &rarr; Platform</button>
             <button data-cmd="ARM" data-arg="CTP">Car &rarr; Platform</button>
         </div>
     </div>
@@ -742,16 +871,17 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         <h2>Mode</h2>
         <div class="grid-2">
             <button id="btnAuto" data-cmd="AUTO" data-arg="TOGGLE">Autonomous</button>
-            <button data-cmd="SCAN" data-arg="QR">Scan QR</button>
+            <button id="btnScanQR" data-cmd="SCAN" data-arg="QR">Scan QR</button>
         </div>
     </div>
+    </div>
 
+    <div id="topPanels">
     <div class="card" id="camCard">
         <h2>Camera</h2>
-        <div class="grid-2" style="margin-bottom:10px;">
-            <button id="btnPerformIK" disabled>Perform IK Pickup</button>
-        </div>
         <div class="telemetry">
+            <div class="tile" style="grid-column:span 2"><div class="label">Scan Status</div><div class="val small" id="camScanStatus">--</div></div>
+            <div class="tile" style="grid-column:span 2"><div class="label">Heading</div><div class="val" id="heading">0.0°</div></div>
             <div class="tile"><div class="label">QR Message</div><div class="val small" id="camMsg">--</div></div>
             <div class="tile"><div class="label">Color</div><div class="val" id="camColor">--</div></div>
             <div class="tile"><div class="label">Distance</div><div class="val" id="camDist">--</div></div>
@@ -764,6 +894,7 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
     <div class="card">
         <h2>Event Log</h2>
         <div class="log" id="log"></div>
+    </div>
     </div>
 
     <script>
@@ -780,10 +911,10 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         function setArmBusy(busy){
             armBusy=busy;
             document.querySelectorAll('.step-btn').forEach(function(b){b.disabled=busy});
-            $('btnPerformIK').disabled=busy||!lastPose.valid;
             log(busy?'Arm: busy':'Arm: idle',busy?'err':'ok');
         }
         var lastPose={valid:false,color:0,tx:0,ty:0,tz:0,yaw:0,conf:0,msg:''};
+        var scanActive=false;
         var scanMiss=0;
 
         function send(data){
@@ -795,6 +926,29 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
             fetch('/status').then(function(r){return r.json()}).then(function(s){
                 setStatus('ok','connected to base');
                 setArmBusy(s.arm_busy);
+
+                if(s.current_yaw!=null)$('heading').textContent=parseFloat(s.current_yaw).toFixed(1)+'\u00B0';
+
+                var scanBtn=$('btnScanQR');
+                if(s.scan_in_progress){
+                    scanActive=true;
+                    scanBtn.textContent='Scanning...';
+                    scanBtn.classList.add('scanning');
+                    $('camScanStatus').textContent='Accumulating';
+                    $('camScanStatus').style.color='var(--warn)';
+                }else{
+                    scanActive=false;
+                    scanBtn.textContent='Scan QR';
+                    scanBtn.classList.remove('scanning');
+                    if(lastPose.valid){
+                        $('camScanStatus').textContent='DONE';
+                        $('camScanStatus').style.color='var(--ok)';
+                    }else{
+                        $('camScanStatus').textContent='Ready';
+                        $('camScanStatus').style.color='var(--text)';
+                    }
+                }
+
                 if(s.color&&s.color!=='NONE'){
                     $('camCard').style.display='';
                     $('camColor').textContent=s.color;
@@ -819,7 +973,6 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
                     $('camDist').textContent=qr.tz_mm!=null?parseFloat(qr.tz_mm).toFixed(0)+'mm':'--';
                     $('camYaw').textContent=qr.yaw_deg!=null?parseFloat(qr.yaw_deg).toFixed(1)+'\u00B0':'--';
                     $('camPose').textContent=(qr.tx_mm!=null?parseFloat(qr.tx_mm).toFixed(0):'--')+', '+(qr.ty_mm!=null?parseFloat(qr.ty_mm).toFixed(0):'--')+', '+(qr.tz_mm!=null?parseFloat(qr.tz_mm).toFixed(0):'--');
-                    $('btnPerformIK').disabled=!qr.pose_valid||armBusy;
                     if(qr.pose_valid)log('QR decoded: '+(qr.qr_msg||'(no text)')+' color='+(qr.color_name||'?'),'ok');
                     scanMiss=0;
                 }else if(!s.qr_pending){
@@ -847,15 +1000,27 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         });
 
         document.querySelectorAll('button[data-cmd]').forEach(function(b){
-            if(b.closest('.pad'))return;
+            if(b.closest('.pad')||b.id==='btnScanQR')return;
             b.addEventListener('click',function(){send({cmd:b.dataset.cmd,arg:b.dataset.arg})});
         });
         $('btnAuto').addEventListener('click',function(){$('btnAuto').classList.toggle('active')});
-
-        $('btnPerformIK').addEventListener('click',function(){
-            if(!lastPose.valid||armBusy)return;
-            send({cmd:'ARM',arg:'CAM_PICKUP'});
-            log('Sending IK pickup: color='+lastPose.color+' pose=('+lastPose.tx+','+lastPose.ty+','+lastPose.tz+')','');
+        $('btnScanQR').addEventListener('click',function(){
+            if(scanActive){
+                send({cmd:'SCAN',arg:'STOP'});
+                scanActive=false;
+            }else{
+                send({cmd:'SCAN',arg:'QR'});
+                scanActive=true;
+                $('camMsg').textContent='--';
+                $('camColor').textContent='--';
+                $('camDist').textContent='--';
+                $('camYaw').textContent='--';
+                $('camConf').textContent='--';
+                $('camPose').textContent='--';
+                $('camScanStatus').textContent='Scanning...';
+                $('camScanStatus').style.color='var(--warn)';
+                lastPose={valid:false,color:0,tx:0,ty:0,tz:0,yaw:0,conf:0,msg:''};
+            }
         });
 
         var speedT;
@@ -866,14 +1031,27 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         });
 
         var stepJoints=['J1','J2','J3','J4','J5'];
-        document.querySelectorAll('.step-btn').forEach(function(btn){
-            btn.addEventListener('click',function(){
-                if(armBusy)return;
-                var j=parseInt(btn.dataset.joint);
-                var dir=btn.dataset.dir==='+'?1:-1;
-                var deg=parseInt($('stepSize').value)||5;
+        var stepInterval=null;
+        function startStep(btn){
+            if(armBusy||btn.disabled)return;
+            var j=parseInt(btn.dataset.joint);
+            var dir=btn.dataset.dir==='+'?1:-1;
+            var deg=parseInt($('stepSize').value)||5;
+            send({cmd:'SSTEP',arg:stepJoints[j]+','+(dir*deg)});
+            stopStep();
+            stepInterval=setInterval(function(){
+                if(armBusy){stopStep();return;}
                 send({cmd:'SSTEP',arg:stepJoints[j]+','+(dir*deg)});
-            });
+            },150);
+        }
+        function stopStep(){
+            if(stepInterval){clearInterval(stepInterval);stepInterval=null;}
+        }
+        document.querySelectorAll('.step-btn').forEach(function(btn){
+            btn.addEventListener('pointerdown',function(e){e.preventDefault();startStep(btn);});
+            btn.addEventListener('pointerup',stopStep);
+            btn.addEventListener('pointerleave',stopStep);
+            btn.addEventListener('pointercancel',stopStep);
         });
 
         var keyMap={ArrowUp:'FWD',ArrowDown:'BACK',ArrowLeft:'LEFT',ArrowRight:'RIGHT'};
@@ -899,10 +1077,25 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
 void setup() {
   Serial.begin(115200);
 
-  // I2C: 40 kHz (matches working Blynk config)
-  Wire.begin(SDA_PIN, SCL_PIN, 40000);
+  // I2C: Start at 400kHz for MPU6050 DMP init
+  Wire.begin(SDA_PIN, SCL_PIN, 400000);
   Wire.setTimeOut(200);
   delay(500);
+
+  // MPU6050 DMP init
+  mpu.initialize();
+  if (mpu.dmpInitialize() == 0) {
+    mpu.CalibrateAccel(6);
+    mpu.CalibrateGyro(6);
+    mpu.setDMPEnabled(true);
+    dmpReady = true;
+    Serial.println("MPU6050 DMP Ready");
+  } else {
+    Serial.println("MPU6050 DMP INIT FAILED");
+  }
+
+  // Switch to 40kHz for motor driver
+  Wire.setClock(40000);
 
   // Motor driver init (type=3, polarity=0 = normal 4-wheel mecanum)
   uint8_t motorType = 3;
@@ -978,6 +1171,9 @@ void setup() {
     json += "\"arm_busy\":" + String(lastArmStatus.busy ? "true" : "false");
     json += ",\"autonomous\":" + String(autonomousMode ? "true" : "false");
     json += ",\"qr_pending\":" + String(newQrResult ? "false" : "true");
+    json += ",\"scan_in_progress\":" + String(scanInProgress ? "true" : "false");
+    json += ",\"scan_status\":\"" + String(scanInProgress ? "Accumulating" : "DONE") + "\"";
+    json += ",\"current_yaw\":" + String(currentYaw, 1);
 
     if (newQrResult) {
       json += ",\"qr_result\":{";
@@ -990,6 +1186,7 @@ void setup() {
       json += ",\"tz_mm\":" + String(lastQrTz, 0);
       json += ",\"yaw_deg\":" + String(lastQrYaw, 1);
       json += ",\"qr_msg\":\"QR Color " + String(colorName(lastQrColor)) + "\"";
+      json += ",\"scan_status\":\"" + String(lastScanStatus == 1 ? "DONE" : "Accumulating") + "\"";
       json += "}";
     }
     json += "}";
@@ -1018,16 +1215,27 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  // =================== CONTINUOUS MOVEMENT ===================
+  if (!autonomousMode) updateMotors();
+
+  // =================== SCAN TIMEOUT WATCHDOG ===================
+  if (scanInProgress && millis() - scanStartMs > 40000) {
+    scanInProgress = false;
+    Serial.println("[CAM] Scan timeout — forcing scanInProgress=false");
+  }
+
   // =================== DEFERRED ESP-NOW DATA ===================
   if (cameraPoseReceived) {
     cameraPoseReceived = false;
     PoseReply reply;
+    portENTER_CRITICAL(&camMux);
     memcpy(&reply, (const void *)&lastPoseReply, sizeof(reply));
+    portEXIT_CRITICAL(&camMux);
     Serial.printf(
         "[CAM] Pose: valid=%d color=%d conf=%.2f yaw=%.1f tz=%.1f est=%d\n",
         reply.pose_valid, reply.color, reply.confidence,
         reply.yaw_deg, reply.tz_mm, reply.estimated);
-    if (reply.color != 0xFF) {
+    if (reply.status == 1 || (reply.pose_valid && reply.confidence > 0.0f)) {
       lastQrValid = reply.pose_valid;
       lastQrColor = reply.color;
       lastQrTx = reply.tx_mm;
@@ -1036,6 +1244,10 @@ void loop() {
       lastQrYaw = reply.yaw_deg;
       lastQrConf = reply.confidence;
       newQrResult = true;
+    }
+    // Camera still accumulating — reset watchdog so base doesn't timeout mid-retry
+    if (reply.status == 0) {
+      scanStartMs = millis();
     }
   }
   if (armStatusReceived) {
@@ -1046,7 +1258,7 @@ void loop() {
   }
 
   // =================== STEP HANDLER ===================
-  if (pendingStep) {
+  if (pendingStep && !moveActive) {
     float stepDist = 50.0;
     float stepDeg = 15.0;
     if (stepArg == "FWD") {
@@ -1092,9 +1304,9 @@ void loop() {
       const char *armCmd;
       const char *label;
     } const targets[] = {
-        {ARM_COLOR_R, "RTF", "RED"},
-        {ARM_COLOR_G, "GTF", "GREEN"},
-        {ARM_COLOR_B, "BTF", "BLUE"},
+        {ARM_COLOR_R, "RTP", "RED"},
+        {ARM_COLOR_G, "GTP", "GREEN"},
+        {ARM_COLOR_B, "BTP", "BLUE"},
     };
 
     for (int i = 0; i < 3; i++) {
