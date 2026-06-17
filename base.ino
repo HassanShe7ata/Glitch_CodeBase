@@ -562,6 +562,27 @@ static bool alignToQR() {
 }
 
 // ================================================================
+// WAIT FOR ARM IDLE
+// ================================================================
+
+// Blocks until arm finishes current command (busy -> idle transition).
+// Returns true if arm went idle, false on timeout or autonomousMode=false.
+static bool waitForArmIdle(unsigned long timeout_ms) {
+  delay(300);  // Give arm time to receive command and go busy
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeout_ms) {
+    if (!autonomousMode) return false;
+    ArmStatus st;
+    memcpy(&st, (const void *)&lastArmStatus, sizeof(st));
+    if (!st.busy) return true;
+    server.handleClient();
+    delay(100);
+  }
+  Serial.println("[AUTO] Arm idle timeout");
+  return false;
+}
+
+// ================================================================
 // SERVO STEP
 // ================================================================
 
@@ -807,6 +828,15 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
             .pad button { font-size: 22px; }
             button { padding: 10px 6px; font-size: 13px; }
         }
+        .btn-r{background:#dc2626;border-color:#ef4444;color:#fff}
+        .btn-r:active{background:#ef4444;box-shadow:0 0 12px rgba(239,68,68,0.5)}
+        .btn-g{background:#16a34a;border-color:#22c55e;color:#fff}
+        .btn-g:active{background:#22c55e;box-shadow:0 0 12px rgba(34,197,94,0.5)}
+        .btn-b{background:#2563eb;border-color:#3b82f6;color:#fff}
+        .btn-b:active{background:#3b82f6;box-shadow:0 0 12px rgba(59,130,246,0.5)}
+        .btn-auto{background:#f59e0b;border-color:#f59e0b;color:#000;font-size:16px;font-weight:700;width:100%;margin-bottom:8px}
+        .btn-auto:active{background:#d97706;box-shadow:0 0 12px rgba(245,158,11,0.5)}
+        .btn-auto.active{background:#ef4444;border-color:#ef4444;color:#fff}
     </style>
 </head>
 <body>
@@ -839,16 +869,23 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
     </div>
 
     <div class="card">
-        <h2>Arm Commands</h2>
-        <div class="grid-2">
-            <button data-cmd="ARM" data-arg="GTP">Green &rarr; Platform</button>
-            <button data-cmd="ARM" data-arg="BTC">Blue &rarr; Car</button>
-            <button data-cmd="ARM" data-arg="RTC">Red &rarr; Car</button>
-            <button data-cmd="ARM" data-arg="GTC">Green &rarr; Car</button>
+        <h2>Arm</h2>
+        <div class="grid-3" style="margin-bottom:10px;">
             <button data-cmd="ARM" data-arg="HOME" class="danger">Home</button>
-            <button data-cmd="ARM" data-arg="RTP">Red &rarr; Platform</button>
-            <button data-cmd="ARM" data-arg="BTP">Blue &rarr; Platform</button>
-            <button data-cmd="ARM" data-arg="CTP">Car &rarr; Platform</button>
+            <button data-cmd="ARM" data-arg="SCAN_POSE">Scan Pose</button>
+            <button data-cmd="ARM" data-arg="CTP">Car &rarr; Plt</button>
+        </div>
+        <div class="section-label">To Platform</div>
+        <div class="grid-3">
+            <button data-cmd="ARM" data-arg="RTP" class="btn-r">R &rarr; Plt</button>
+            <button data-cmd="ARM" data-arg="GTP" class="btn-g">G &rarr; Plt</button>
+            <button data-cmd="ARM" data-arg="BTP" class="btn-b">B &rarr; Plt</button>
+        </div>
+        <div class="section-label" style="margin-top:8px">To Car</div>
+        <div class="grid-3">
+            <button data-cmd="ARM" data-arg="RTC" class="btn-r">R &rarr; Car</button>
+            <button data-cmd="ARM" data-arg="GTC" class="btn-g">G &rarr; Car</button>
+            <button data-cmd="ARM" data-arg="BTC" class="btn-b">B &rarr; Car</button>
         </div>
     </div>
 
@@ -869,10 +906,8 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
 
     <div class="card">
         <h2>Mode</h2>
-        <div class="grid-2">
-            <button id="btnAuto" data-cmd="AUTO" data-arg="TOGGLE">Autonomous</button>
-            <button id="btnScanQR" data-cmd="SCAN" data-arg="QR">Scan QR</button>
-        </div>
+        <button id="btnAuto" class="btn-auto" data-cmd="AUTO" data-arg="TOGGLE">START AUTONOMOUS</button>
+        <button id="btnScanQR" data-cmd="SCAN" data-arg="QR" style="width:100%">Scan QR</button>
     </div>
     </div>
 
@@ -910,7 +945,6 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         var armBusy=false;
         function setArmBusy(busy){
             armBusy=busy;
-            document.querySelectorAll('.step-btn').forEach(function(b){b.disabled=busy});
             log(busy?'Arm: busy':'Arm: idle',busy?'err':'ok');
         }
         var lastPose={valid:false,color:0,tx:0,ty:0,tz:0,yaw:0,conf:0,msg:''};
@@ -926,6 +960,14 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
             fetch('/status').then(function(r){return r.json()}).then(function(s){
                 setStatus('ok','connected to base');
                 setArmBusy(s.arm_busy);
+
+                if(s.autonomous){
+                    $('btnAuto').classList.add('active');
+                    $('btnAuto').textContent='RUNNING...';
+                }else{
+                    $('btnAuto').classList.remove('active');
+                    $('btnAuto').textContent='START AUTONOMOUS';
+                }
 
                 if(s.current_yaw!=null)$('heading').textContent=parseFloat(s.current_yaw).toFixed(1)+'\u00B0';
 
@@ -1033,14 +1075,13 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         var stepJoints=['J1','J2','J3','J4','J5'];
         var stepInterval=null;
         function startStep(btn){
-            if(armBusy||btn.disabled)return;
+            if(btn.disabled)return;
             var j=parseInt(btn.dataset.joint);
             var dir=btn.dataset.dir==='+'?1:-1;
             var deg=parseInt($('stepSize').value)||5;
             send({cmd:'SSTEP',arg:stepJoints[j]+','+(dir*deg)});
             stopStep();
             stepInterval=setInterval(function(){
-                if(armBusy){stopStep();return;}
                 send({cmd:'SSTEP',arg:stepJoints[j]+','+(dir*deg)});
             },150);
         }
@@ -1295,61 +1336,64 @@ void loop() {
       (unsigned long)espNowRecvNoMatch);
   }
 
-  // =================== AUTONOMOUS MODE ===================
+  // =================== AUTONOMOUS SEQUENCE ===================
+  // Fixed competition sequence — runs to completion once started.
+  // To modify: change distances (mm), arm commands, or step order.
+  // Each step: movement (vector + distance in mm) or arm action (command + wait).
+  // Sequence: FWD 1m -> Red->Plat -> LEFT 1m -> BACK 1m -> Blue->Plat
+  //           -> RIGHT 1m -> Green->Plat -> DIAG 1m
+  // Toggle autonomous OFF to stop mid-sequence.
   if (autonomousMode && autoTrigger == 1) {
-    Serial.println("[AUTO] Starting camera-guided autonomous pickup");
-
-    struct {
-      uint8_t colorCode;
-      const char *armCmd;
-      const char *label;
-    } const targets[] = {
-        {ARM_COLOR_R, "RTP", "RED"},
-        {ARM_COLOR_G, "GTP", "GREEN"},
-        {ARM_COLOR_B, "BTP", "BLUE"},
-    };
-
-    for (int i = 0; i < 3; i++) {
-      if (!autonomousMode)
-        break;
-      Serial.printf("[AUTO] --- Target %d: %s ---\n", i + 1, targets[i].label);
-
-      if (!alignToQR()) {
-        Serial.printf("[AUTO] Alignment failed for %s, skipping\n",
-                      targets[i].label);
-        continue;
-      }
-
-      if (!autonomousMode)
-        break;
-
-      if (lastPoseReply.color == targets[i].colorCode) {
-        Serial.printf("[AUTO] Color match: %s — sending camera pose to arm\n",
-                      targets[i].label);
-        sendCameraPoseToArm();
-
-        unsigned long t0 = millis();
-        while (millis() - t0 < 12000) {
-          server.handleClient();
-          if (!autonomousMode)
-            break;
-          delay(50);
-        }
-      } else {
-        const char *cn[] = {"NONE", "RED", "GREEN", "BLUE"};
-        int ci = lastPoseReply.color;
-        if (ci > 3) ci = 0;
-        Serial.printf(
-            "[AUTO] Color mismatch: expected %s, camera sees %s — skipping\n",
-            targets[i].label, cn[ci]);
-      }
-    }
-
-    if (autonomousMode)
-      sendCommandToArm("H");
-    forceStop();
     autoTrigger = 0;
+    Serial.println("[AUTO] === Starting fixed autonomous sequence ===");
+
+    // --- Step 1: Move FORWARD 1 meter ---
+    Serial.println("[AUTO] Step 1: Forward 1m");
+    moveDistanceKp(V_FORWARD, Motor_speed, 1000.0, TICKS_FWD_BWD);
+    if (!autonomousMode) goto autoEnd;
+
+    // --- Step 2: Drop RED box on platform ---
+    // Arm: pick from red pos, transit home (gripper closed), place at platform
+    Serial.println("[AUTO] Step 2: Red -> Platform");
+    sendCommandToArm("RTP");
+    waitForArmIdle(20000);
+    if (!autonomousMode) goto autoEnd;
+
+    // --- Step 3: Move LEFT 1 meter ---
+    Serial.println("[AUTO] Step 3: Left 1m");
+    moveDistanceKp(V_STRAFE_L, Motor_speed, 1000.0, TICKS_STRAFE);
+    if (!autonomousMode) goto autoEnd;
+
+    // --- Step 4: Move BACKWARD 1 meter ---
+    Serial.println("[AUTO] Step 4: Backward 1m");
+    moveDistanceKp(V_BACKWARD, Motor_speed, 1000.0, TICKS_FWD_BWD);
+    if (!autonomousMode) goto autoEnd;
+
+    // --- Step 5: Drop BLUE box on platform ---
+    Serial.println("[AUTO] Step 5: Blue -> Platform");
+    sendCommandToArm("BTP");
+    waitForArmIdle(20000);
+    if (!autonomousMode) goto autoEnd;
+
+    // --- Step 6: Move RIGHT 1 meter ---
+    Serial.println("[AUTO] Step 6: Right 1m");
+    moveDistanceKp(V_STRAFE_R, Motor_speed, 1000.0, TICKS_STRAFE);
+    if (!autonomousMode) goto autoEnd;
+
+    // --- Step 7: Drop GREEN box on platform ---
+    Serial.println("[AUTO] Step 7: Green -> Platform");
+    sendCommandToArm("GTP");
+    waitForArmIdle(20000);
+    if (!autonomousMode) goto autoEnd;
+
+    // --- Step 8: Move DIAGONAL (forward-right) 1 meter ---
+    Serial.println("[AUTO] Step 8: Diagonal 1m");
+    moveDistanceKp(V_DIAG_FR, Motor_speed, 1000.0, TICKS_DIAG);
+
+    Serial.println("[AUTO] === Sequence complete ===");
+    autoEnd:
+    forceStop();
     autonomousMode = false;
-    Serial.println("[AUTO] Autonomous pickup complete");
+    Serial.println("[AUTO] Autonomous sequence ended");
   }
 }
