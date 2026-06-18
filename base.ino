@@ -1005,6 +1005,8 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
                     $('camMsg').textContent=qr.qr_msg||'(no text)';
                     $('camColor').textContent=qr.color_name||'--';
                     $('camConf').textContent=qr.confidence!=null?(parseFloat(qr.confidence)).toFixed(2):'--';
+                    $('camDist').textContent=qr.tz_mm!=null?parseFloat(qr.tz_mm).toFixed(0)+'mm':'--';
+                    $('camYaw').textContent=qr.yaw_deg!=null?parseFloat(qr.yaw_deg).toFixed(1)+'\u00B0':'--';
                     $('camPose').textContent=(qr.tx_mm!=null?parseFloat(qr.tx_mm).toFixed(0):'--')+', '+(qr.ty_mm!=null?parseFloat(qr.ty_mm).toFixed(0):'--')+', '+(qr.tz_mm!=null?parseFloat(qr.tz_mm).toFixed(0):'--');
                     if(qr.pose_valid)log('QR decoded: '+(qr.qr_msg||'(no text)')+' color='+(qr.color_name||'?'),'ok');
                     scanMiss=0;
