@@ -17,6 +17,21 @@ const uint8_t WIFI_CHANNEL = 11;
 // ================= WEB SERVER =================
 WebServer server(80);
 
+// ================= DEAD RECKONING (ENCODER-BASED) =================
+float posX = 0, posY = 0;  // global position in mm
+float velX = 0, velY = 0;  // filtered velocity in mm/s
+float currentSpeed = 0;     // filtered scalar speed mm/s
+float speedKmh = 0;         // filtered speed in km/h
+int32_t lastEncoders[4] = {0, 0, 0, 0};
+unsigned long lastEncoderMs = 0;
+bool encodersInitialized = false;
+// 1980 ticks/rev, 80mm wheel diameter
+const float TICKS_PER_REV = 1980.0f;
+const float WHEEL_DIA_MM = 80.0f;
+const float MM_PER_TICK = (PI * WHEEL_DIA_MM) / TICKS_PER_REV;  // ~0.1269 mm/tick
+// EMA filter (0 < alpha < 1, lower = smoother)
+const float EMA_ALPHA = 0.15f;
+
 // ================= ESP-NOW SHARED ENUMS =================
 enum ArmColorCode : uint8_t {
   ARM_COLOR_UNKNOWN = 0,
@@ -153,6 +168,8 @@ float ypr[3];
 float currentYaw = 0;
 float targetHeading = 0;
 void updateYaw();
+void updateDeadReckoning();
+void trackMovement(const int8_t vector[], float dist_mm);
 
 // --- CALIBRATED TICK CONSTANTS (Blynk values × 97/80, distance in meters) ---
 const float TICKS_FWD_BWD = 6717.25f;
@@ -450,6 +467,7 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
       Serial.println("[ERR] Move timed out (blocked or stalled), aborting");
       break;
     }
+    updateDeadReckoning();
     delay(15);
   }
   forceStop();
@@ -473,6 +491,7 @@ void rotateDegrees(bool clockwise, float degrees, int8_t maxSpeed) {
 
     writeSpeeds(turnSpeed * V_ROTATE_CW[0], turnSpeed * V_ROTATE_CW[1],
                 turnSpeed * V_ROTATE_CW[2], turnSpeed * V_ROTATE_CW[3]);
+    updateDeadReckoning();
     delay(10);
   }
   forceStop();
@@ -501,6 +520,8 @@ static bool waitForCameraPose(unsigned long timeout_ms, PoseReply *out) {
       }
       // Partial update (status=0) — keep waiting for DONE
     }
+    updateYaw();
+    updateDeadReckoning();
     delay(20);
   }
   Serial.println("[AUTO] Camera scan timeout");
@@ -579,6 +600,8 @@ static bool waitForArmIdle(unsigned long timeout_ms) {
     memcpy(&st, (const void *)&lastArmStatus, sizeof(st));
     if (!st.busy) return true;
     server.handleClient();
+    updateYaw();
+    updateDeadReckoning();
     delay(100);
   }
   Serial.println("[AUTO] Arm idle timeout");
@@ -689,11 +712,15 @@ void handleCommand(const String &msg) {
       } else if (arg == "CTP") {
         sendCommandToArm("CTP");
       } else if (arg == "CAM_PICKUP") {
-        // Start QR scan; when result arrives, loop() auto-forwards pose to arm
+        // Step 1: Move arm home so camera is at known fixed position
+        sendCommandToArm("H");
+        Serial.println("[CAM] Camera guided pickup: homing arm...");
+        delay(3000);
+        // Step 2: Start QR scan; when result arrives, loop() auto-forwards to arm
         camPickupPending = true;
         newQrResult = false;
         sendScanRequest(0);
-        Serial.println("[CAM] Camera guided pickup: scan started, waiting for result");
+        Serial.println("[CAM] Scan started, waiting for result...");
     } else {
       sendCommandToArm(arg.c_str());
     }
@@ -739,8 +766,97 @@ void handleCommand(const String &msg) {
 }
 
 // ================================================================
-// WEBSOCKET EVENT HANDLER
+// DEAD RECKONING — update global position from robot-frame movement
 // ================================================================
+// Vectors: {FL, FR, RL, RR} with mecanum convention.
+// Positive X = forward, Positive Y = left in robot frame.
+void trackMovement(const int8_t vector[], float dist_mm) {
+  // Determine robot-frame displacement from mecanum vector
+  float dx_r = 0, dy_r = 0;
+  if (vector[0] == 1 && vector[1] == -1 && vector[2] == -1 && vector[3] == 1) {
+    dx_r = dist_mm;   // FORWARD
+  } else if (vector[0] == -1 && vector[1] == 1 && vector[2] == 1 && vector[3] == -1) {
+    dx_r = -dist_mm;  // BACKWARD
+  } else if (vector[0] == -1 && vector[1] == -1 && vector[2] == -1 && vector[3] == -1) {
+    dy_r = dist_mm;   // STRAFE LEFT
+  } else if (vector[0] == 1 && vector[1] == 1 && vector[2] == 1 && vector[3] == 1) {
+    dy_r = -dist_mm;  // STRAFE RIGHT
+  } else if (vector[0] == -1 && vector[1] == 1 && vector[2] == -1 && vector[3] == 1) {
+    dx_r = dist_mm; dy_r = dist_mm;   // DIAG FL
+  } else if (vector[0] == 1 && vector[1] == 1 && vector[2] == -1 && vector[3] == -1) {
+    dx_r = dist_mm; dy_r = -dist_mm;  // DIAG FR
+  } else if (vector[0] == -1 && vector[1] == -1 && vector[2] == 1 && vector[3] == 1) {
+    dx_r = -dist_mm; dy_r = dist_mm;  // DIAG BL
+  } else if (vector[0] == 1 && vector[1] == -1 && vector[2] == 1 && vector[3] == -1) {
+    dx_r = -dist_mm; dy_r = -dist_mm; // DIAG BR
+  } else {
+    return; // unknown vector
+  }
+
+  float heading_rad = currentYaw * PI / 180.0f;
+  float c = cosf(heading_rad), s = sinf(heading_rad);
+  posX += dx_r * c - dy_r * s;
+  posY += dx_r * s + dy_r * c;
+}
+
+// ================================================================
+// CONTINUOUS ENCODER DEAD RECKONING — called from loop()
+// Mecanum kinematics: 1980 ticks/rev, 80mm wheels
+// Motor order: FL(0), FR(1), BL(2), BR(3)
+// V_FORWARD = {1,-1,-1,1} → encoder sign convention
+// ================================================================
+void updateDeadReckoning() {
+  unsigned long now = millis();
+  float dt = (now - lastEncoderMs) / 1000.0f;
+  if (dt < 0.02f) return;  // max 50Hz
+  if (dt > 0.5f) {         // first call or long gap — just initialize
+    lastEncoderMs = now;
+    int32_t enc[4];
+    if (readEncoders(enc)) {
+      for (int i = 0; i < 4; i++) lastEncoders[i] = enc[i];
+      encodersInitialized = true;
+    }
+    return;
+  }
+  lastEncoderMs = now;
+
+  int32_t enc[4];
+  if (!readEncoders(enc)) return;
+  if (!encodersInitialized) {
+    for (int i = 0; i < 4; i++) lastEncoders[i] = enc[i];
+    encodersInitialized = true;
+    return;
+  }
+
+  // Deltas in encoder ticks
+  float d[4];
+  for (int i = 0; i < 4; i++) {
+    d[i] = (float)(enc[i] - lastEncoders[i]);
+    lastEncoders[i] = enc[i];
+  }
+
+  // Mecanum inverse kinematics (robot frame)
+  // V_FORWARD = {1,-1,-1,1} convention
+  float vx_r = (d[0] - d[1] - d[2] + d[3]) / 4.0f * MM_PER_TICK;
+  float vy_r = -(d[0] + d[1] + d[2] + d[3]) / 4.0f * MM_PER_TICK;
+
+  // Raw velocity from encoders (mm/s)
+  float rawVx = vx_r / dt;
+  float rawVy = vy_r / dt;
+
+  // EMA low-pass filter
+  velX = EMA_ALPHA * rawVx + (1.0f - EMA_ALPHA) * velX;
+  velY = EMA_ALPHA * rawVy + (1.0f - EMA_ALPHA) * velY;
+  float rawSpeed = sqrtf(rawVx * rawVx + rawVy * rawVy);
+  currentSpeed = EMA_ALPHA * rawSpeed + (1.0f - EMA_ALPHA) * currentSpeed;
+  speedKmh = currentSpeed * 0.0036f;  // mm/s -> km/h
+
+  // Rotate to global frame using current heading (updateYaw called from loop())
+  float heading_rad = currentYaw * PI / 180.0f;
+  float c = cosf(heading_rad), s = sinf(heading_rad);
+  posX += vx_r * c - vy_r * s;
+  posY += vx_r * s + vy_r * c;
+}
 
 // ================================================================
 // CONTROLLER HTML (embedded)
@@ -1100,6 +1216,252 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 // ================================================================
+// DASHBOARD HTML (embedded) — display only, no controls
+// ================================================================
+
+const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Robot Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-serif;height:100vh;overflow:hidden}
+.grid{display:grid;grid-template-columns:1fr 320px;grid-template-rows:auto 1fr;gap:8px;padding:8px;height:100vh}
+.panel{background:#12121a;border:1px solid #2a2a3a;border-radius:8px;padding:12px;overflow:hidden}
+.panel h3{font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:#666;margin-bottom:8px}
+.cam-wrap{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#000;border-radius:6px;overflow:hidden}
+.cam-wrap img{max-width:100%;max-height:100%;object-fit:contain}
+.cam-label{position:absolute;top:8px;left:8px;background:rgba(0,0,0,0.7);color:#0f0;font-size:10px;padding:2px 8px;border-radius:4px;font-family:monospace}
+.right-stack{display:flex;flex-direction:column;gap:8px}
+.map-wrap{flex:1;position:relative;min-height:0}
+.map-wrap canvas{width:100%;height:100%;border-radius:6px}
+.info-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.stat{text-align:center}
+.stat .val{font-size:28px;font-weight:700;font-family:'Courier New',monospace;color:#0af;line-height:1.2}
+.stat .val.sm{font-size:16px}
+.stat .lbl{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:1px}
+.compass-wrap{position:relative;width:100%;aspect-ratio:1;max-height:200px;margin:0 auto}
+.compass-wrap canvas{width:100%;height:100%}
+.conn-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:middle}
+.conn-dot.on{background:#0f0;box-shadow:0 0 6px #0f0}
+.conn-dot.off{background:#f00;box-shadow:0 0 6px #f00}
+.conn-dot.warn{background:#fa0;box-shadow:0 0 6px #fa0}
+.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.hdr .title{font-size:13px;font-weight:600;letter-spacing:0.5px}
+.mode-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;font-family:monospace;letter-spacing:1px}
+.mode-auto{background:rgba(251,191,36,0.2);color:#fbbf24;border:1px solid rgba(251,191,36,0.4)}
+.mode-manual{background:rgba(52,211,153,0.2);color:#34d399;border:1px solid rgba(52,211,153,0.4)}
+</style>
+</head>
+<body>
+<div class="grid">
+  <div class="panel" style="grid-row:1/3">
+    <div class="hdr">
+      <h3>Camera Feed</h3>
+      <span><span class="conn-dot off" id="camDot"></span><span id="camStatus" style="font-size:10px;color:#666">Connecting...</span></span>
+    </div>
+    <div class="cam-wrap">
+      <img id="camStream" src="" alt="Camera stream">
+      <div class="cam-label" id="camFps"></div>
+    </div>
+  </div>
+  <div class="right-stack" style="grid-row:1/3">
+    <div class="panel">
+      <div class="hdr">
+        <h3>Status</h3>
+        <span class="mode-badge mode-manual" id="modeBadge">MANUAL</span>
+      </div>
+      <div class="info-row3">
+        <div class="stat"><div class="val sm" id="posX">0.0</div><div class="lbl">X (mm)</div></div>
+        <div class="stat"><div class="val sm" id="posY">0.0</div><div class="lbl">Y (mm)</div></div>
+        <div class="stat"><div class="val sm" id="headingVal">0.0&deg;</div><div class="lbl">Heading</div></div>
+      </div>
+      <div class="info-row3" style="margin-top:8px">
+        <div class="stat"><div class="val sm" id="velX">0</div><div class="lbl">Vx (km/h)</div></div>
+        <div class="stat"><div class="val sm" id="velY">0</div><div class="lbl">Vy (km/h)</div></div>
+        <div class="stat"><div class="val sm" id="speed">0</div><div class="lbl">Speed (km/h)</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Heading</h3>
+      <div class="compass-wrap"><canvas id="compassCvs"></canvas></div>
+    </div>
+    <div class="panel map-wrap">
+      <h3>Global Map</h3>
+      <canvas id="mapCvs"></canvas>
+    </div>
+  </div>
+</div>
+<script>
+const CAM_IP='192.168.4.100';
+const CAM_PORT=81;
+let posX=0,posY=0,heading=0,velX=0,velY=0,speed=0,autoMode=false;
+let trail=[];
+let camRetryCount=0;
+let camLastFrame=0;
+let camTimer=null;
+const camImg=document.getElementById('camStream');
+const camDot=document.getElementById('camDot');
+const camStatus=document.getElementById('camStatus');
+const mapCvs=document.getElementById('mapCvs');
+const compassCvs=document.getElementById('compassCvs');
+const mapCtx=mapCvs.getContext('2d');
+const compCtx=compassCvs.getContext('2d');
+
+camImg.onload=function(){
+  camDot.className='conn-dot on';
+  camStatus.textContent='Connected';
+  camLastFrame=Date.now();
+  camRetryCount=0;
+};
+camImg.onerror=function(){
+  camDot.className='conn-dot off';
+  camStatus.textContent='Disconnected';
+  camRetryCount++;
+  var delay=Math.min(camRetryCount*1500,8000);
+  setTimeout(function(){
+    camImg.src='http://'+CAM_IP+':'+CAM_PORT+'/stream?t='+Date.now();
+  },delay);
+};
+
+camTimer=setInterval(function(){
+  var stale=Date.now()-camLastFrame;
+  if(stale>5000&&camLastFrame>0){
+    camDot.className='conn-dot warn';
+    camStatus.textContent='Stalled \u2014 reconnecting...';
+    camImg.src='http://'+CAM_IP+':'+CAM_PORT+'/stream?t='+Date.now();
+    camLastFrame=Date.now();
+  }
+},3000);
+
+camImg.src='http://'+CAM_IP+':'+CAM_PORT+'/stream?t='+Date.now();
+
+function pollStatus(){
+  fetch('/api/status').then(function(r){return r.json()}).then(function(d){
+    posX=d.x; posY=d.y; heading=d.heading||0;
+    velX=d.velX||0; velY=d.velY||0; speed=d.speed||0;
+    autoMode=d.autonomous||false;
+    document.getElementById('posX').textContent=posX.toFixed(0);
+    document.getElementById('posY').textContent=posY.toFixed(0);
+    document.getElementById('headingVal').textContent=heading.toFixed(1)+'\u00B0';
+    document.getElementById('velX').textContent=velX.toFixed(0);
+    document.getElementById('velY').textContent=velY.toFixed(0);
+    document.getElementById('speed').textContent=speed.toFixed(0);
+    var mb=document.getElementById('modeBadge');
+    if(autoMode){mb.textContent='AUTONOMOUS';mb.className='mode-badge mode-auto';}
+    else{mb.textContent='MANUAL';mb.className='mode-badge mode-manual';}
+    trail.push({x:posX,y:posY});
+    if(trail.length>1000)trail.shift();
+    drawMap();
+    drawCompass();
+  }).catch(function(){});
+}
+setInterval(pollStatus,200);
+pollStatus();
+
+function resizeCanvas(cvs){
+  const r=cvs.parentElement.getBoundingClientRect();
+  const dpr=window.devicePixelRatio||1;
+  cvs.width=r.width*dpr; cvs.height=r.height*dpr;
+  cvs.style.width=r.width+'px'; cvs.style.height=r.height+'px';
+  return dpr;
+}
+
+function drawMap(){
+  const dpr=resizeCanvas(mapCvs);
+  const ctx=mapCtx;
+  const W=mapCvs.width, H=mapCvs.height;
+  ctx.fillStyle='#0a0a12'; ctx.fillRect(0,0,W,H);
+  var maxDist=300;
+  for(var i=0;i<trail.length;i++){
+    var ax=Math.abs(trail[i].x), ay=Math.abs(trail[i].y);
+    if(ax>maxDist)maxDist=ax;
+    if(ay>maxDist)maxDist=ay;
+  }
+  var ax=Math.abs(posX), ay=Math.abs(posY);
+  if(ax>maxDist)maxDist=ax;
+  if(ay>maxDist)maxDist=ay;
+  maxDist=Math.max(maxDist*1.4,150);
+  var scale=Math.min(W,H)/(maxDist*2);
+  var ox=W/2, oy=H/2;
+  ctx.strokeStyle='#1a1a2a'; ctx.lineWidth=1;
+  var gridStep=100;
+  if(maxDist>1000)gridStep=500;
+  else if(maxDist>500)gridStep=200;
+  for(var g=-2000;g<=2000;g+=gridStep){
+    var x=ox+g*scale, y=oy+g*scale;
+    if(x>0&&x<W){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+    if(y>0&&y<H){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+  }
+  if(trail.length>1){
+    ctx.strokeStyle='rgba(0,170,255,0.4)'; ctx.lineWidth=2*dpr;
+    ctx.beginPath();
+    ctx.moveTo(ox-trail[0].y*scale, oy-trail[0].x*scale);
+    for(var i=1;i<trail.length;i++) ctx.lineTo(ox-trail[i].y*scale, oy-trail[i].x*scale);
+    ctx.stroke();
+  }
+  var rx=ox-posY*scale, ry=oy-posX*scale;
+  ctx.fillStyle='#0af';
+  ctx.beginPath(); ctx.arc(rx,ry,6*dpr,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='rgba(0,170,255,0.2)';
+  ctx.beginPath(); ctx.arc(rx,ry,14*dpr,0,Math.PI*2); ctx.fill();
+  var hrad=heading*Math.PI/180;
+  ctx.strokeStyle='#f55'; ctx.lineWidth=2*dpr;
+  ctx.beginPath(); ctx.moveTo(rx,ry);
+  ctx.lineTo(rx-Math.sin(hrad)*25*dpr, ry-Math.cos(hrad)*25*dpr);
+  ctx.stroke();
+  ctx.fillStyle='#555'; ctx.font='bold '+(10*dpr)+'px monospace';
+  ctx.textAlign='center';
+  ctx.fillText('E',ox, oy-H/2+14*dpr);
+  ctx.fillText('W',ox, oy+H/2-6*dpr);
+  ctx.fillText('N',ox-W/2+8*dpr, oy+4*dpr);
+  ctx.fillText('S',ox+W/2-8*dpr, oy+4*dpr);
+  ctx.textAlign='left';
+  ctx.fillStyle='#444'; ctx.font=(9*dpr)+'px monospace';
+  ctx.fillText('Scale: '+maxDist.toFixed(0)+'mm',8*dpr,H-8*dpr);
+}
+
+function drawCompass(){
+  const dpr=resizeCanvas(compassCvs);
+  const ctx=compCtx;
+  const W=compassCvs.width, H=compassCvs.height;
+  const cx=W/2, cy=H/2, R=Math.min(W,H)/2-10*dpr;
+  ctx.clearRect(0,0,W,H);
+  ctx.strokeStyle='#2a2a3a'; ctx.lineWidth=2*dpr;
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,Math.PI*2); ctx.stroke();
+  const labels=[['N',0],['E',90],['S',180],['W',270]];
+  labels.forEach(function(l){
+    const a=(l[1]-90)*Math.PI/180;
+    ctx.fillStyle=(l[0]==='N')?'#f55':'#666';
+    ctx.font='bold '+(11*dpr)+'px sans-serif';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(l[0], cx+Math.cos(a)*(R-14*dpr), cy+Math.sin(a)*(R-14*dpr));
+  });
+  const ha=(heading-90)*Math.PI/180;
+  ctx.save(); ctx.translate(cx,cy); ctx.rotate(ha);
+  ctx.fillStyle='#0af';
+  ctx.beginPath(); ctx.moveTo(R-8*dpr,0);
+  ctx.lineTo(-8*dpr,-6*dpr); ctx.lineTo(-8*dpr,6*dpr);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#333';
+  ctx.beginPath(); ctx.moveTo(-R+8*dpr,0);
+  ctx.lineTo(8*dpr,-4*dpr); ctx.lineTo(8*dpr,4*dpr);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+window.addEventListener('resize',function(){drawMap();drawCompass();});
+drawMap(); drawCompass();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ================================================================
 // SETUP
 // ================================================================
 
@@ -1231,9 +1593,29 @@ void setup() {
     server.send(200, "application/json", "{\"ok\":true}");
   });
 
+  // Dashboard page — display-only monitoring
+  server.on("/dashboard", HTTP_GET, []() {
+    server.send(200, "text/html", DASHBOARD_HTML);
+  });
+
+  // Dashboard API — returns position, heading, velocity, mode as JSON
+  server.on("/api/status", HTTP_GET, []() {
+    String json = "{";
+    json += "\"x\":" + String(posX, 1);
+    json += ",\"y\":" + String(posY, 1);
+    json += ",\"heading\":" + String(currentYaw, 1);
+    json += ",\"velX\":" + String(velX * 0.0036f, 2);
+    json += ",\"velY\":" + String(velY * 0.0036f, 2);
+    json += ",\"speed\":" + String(speedKmh, 2);
+    json += ",\"autonomous\":" + String(autonomousMode ? "true" : "false");
+    json += ",\"mode\":\"" + String(autonomousMode ? "Autonomous" : "Manual") + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
   server.begin();
   Serial.println("Web server started on port 80");
-  Serial.printf("Open http://%s in phone browser\n",
+  Serial.printf("Dashboard: http://%s/dashboard\n",
                 WiFi.softAPIP().toString().c_str());
 }
 
@@ -1243,6 +1625,12 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  // =================== IMU UPDATE (once per loop) ===================
+  updateYaw();
+
+  // =================== ENCODER DEAD RECKONING ===================
+  updateDeadReckoning();
 
   // =================== CONTINUOUS MOVEMENT ===================
   if (!autonomousMode) updateMotors();

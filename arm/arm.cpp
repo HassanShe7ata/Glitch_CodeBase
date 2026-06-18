@@ -272,10 +272,14 @@ static void cameraGuidedPickup() {
   // Move home first so currentAngle[] is known for cameraToBase FK
   goHome();
 
+  float alpha_deg = currentAngle[1] - currentAngle[2];
   Serial.printf("[CAM] Guided pickup: color=%d conf=%.2f "
-                "qr=(%.0f,%.0f,%.0f) yaw=%.1f\n",
+                "qr=(%.0f,%.0f,%.0f) yaw=%.1f alpha=%.1f\n",
                 p->color, p->confidence, p->tx_mm, p->ty_mm, p->tz_mm,
-                p->yaw_deg);
+                p->yaw_deg, alpha_deg);
+  Serial.printf("[CAM] Joint angles: [%.0f, %.0f, %.0f, %.0f]\n",
+                currentAngle[0], currentAngle[1], currentAngle[2],
+                currentAngle[3]);
 
   // 1. Convert QR position from camera frame -> arm base frame
   float x_qr, y_qr, z_qr;
