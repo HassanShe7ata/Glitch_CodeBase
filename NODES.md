@@ -26,7 +26,9 @@ expects inside a `uint8_t[6]`).
 |---------|-----------------------|---------------------|----------------------------|----------------------------------|
 | Camera  | ESP32-S3 (QFN56)      | COM3 (CH340)        | `94:A9:90:08:B2:B8`        | `{0xB8, 0xB2, 0x08, 0x90, 0xA9, 0x94}` |
 | Arm     | ESP32-D0WD-V3 (rev 3.1) | COM15 (CP210x)     | `68:FE:71:12:5D:A8`        | `{0xA8, 0x5D, 0x12, 0x71, 0xFE, 0x68}` |
-| Base    | ESP32 (trust, prior test) | n/a — not enumerable 2026-06-11 | `80:F3:DA:42:3E:5C` | `{0x5C, 0x3E, 0x42, 0xDA, 0xF3, 0x80}` |
+| Base    | ESP32 (trust, prior test) | n/a — not enumerable 2026-06-11 | `80:F3:DA:42:3E:5C` (STA) / `80:F3:DA:42:3E:5D` (AP) | `{0x5C, 0x3E, 0x42, 0xDA, 0xF3, 0x80}` (STA) / `{0x5D, 0x3E, 0x42, 0xDA, 0xF3, 0x80}` (AP) |
+
+> **Note:** The ESP32 has separate MAC addresses for STA and AP interfaces. The efuse read returns the STA MAC (`0x5C`). The AP MAC is STA + 1 (`0x5D`). ESP-NOW peers must use the AP MAC since the Base operates as `WIFI_IF_AP`. All active firmware correctly uses `0x5D` for the Base.
 
 > Historical note: the old ESP-NOW code stored MACs MSB-first in `uint8_t[]`
 > arrays (e.g. `{0x94, 0xA9, 0x90, 0x08, 0xB2, 0xB8}`). The current UDP

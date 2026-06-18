@@ -1,0 +1,3 @@
+timestamp,scenario,x_offset_mm,y_offset_mm,z_offset_mm,yaw_offset_deg,notes,mode,samples,detection_ratio,decode_ratio_when_detected,camera_status_ok_ratio,confidence_mean,tz_mean_mm,tz_std_mm,proc_ms_mean,proc_ms_p95
+2026-03-14T01:35:32,S3_decode_stability_daylight_r2,25,6,17,30,daylight; medium yaw; brief shake; r2 decode-priority tune,capture,13,1.000,0.000,1.000,0.7055384615384616,129.59230769230768,17.241517938638765,532.9230769230769,1801
+2026-03-14T01:46:12,S4_decode_recovery_bias_sweep,25,6,17,30,daylight; medium yaw; brief shake; r3 bias sweep,capture,29,0.966,0.321,1.000,0.6224285714285714,248.23571428571427,0.07659860924831802,4819.172413793103,8152
