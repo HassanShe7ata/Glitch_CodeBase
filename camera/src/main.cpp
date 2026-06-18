@@ -121,18 +121,18 @@ static void OnEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
         Serial.printf("[ESP-NOW] Scan request: task=%d mode=%d\n", req.task_id, req.mode);
 
         // Wake qr_task from sleep, or restart if already scanning
-        if (!g_scan_wake_sem) { espNowRxValid++; return; }  // camera not initialized
+        if (!g_scan_wake_sem) { espNowRxInvalid++; return; }  // camera not initialized
         portENTER_CRITICAL(&g_scan_mux);
         ScanState st = g_scan_state;
         portEXIT_CRITICAL(&g_scan_mux);
         if (st == SCAN_SLEEP) {
-            portENTER_CRITICAL(&g_scan_mux);
-            g_scan_state = SCAN_ACTIVE;
-            portEXIT_CRITICAL(&g_scan_mux);
+            // Task will set SCAN_ACTIVE after taking semaphore — just wake it
             xSemaphoreGive(g_scan_wake_sem);
         } else {
             // Already scanning — signal qr_task to restart (no direct mutation)
+            portENTER_CRITICAL(&g_scan_mux);
             g_scan_restart = true;
+            portEXIT_CRITICAL(&g_scan_mux);
             Serial.printf("[SCAN] Restart requested by new scan (task=%d)\n", req.task_id);
         }
         return;
@@ -1182,7 +1182,9 @@ static void process_qr_frame() {
         if (stable_enough || (timeout_reached && has_detection)) {
             // SUCCESS: valid detection found — send DONE, return to sleep
             sendPoseUpdate(1);
+            portENTER_CRITICAL(&g_scan_mux);
             g_scan_state = SCAN_SLEEP;
+            portEXIT_CRITICAL(&g_scan_mux);
             g_stable_count = 0;
             g_scan_frame_count = 0;
             g_scan_retries = 0;
@@ -1208,7 +1210,9 @@ static void process_qr_frame() {
                 // Exhausted retries — give up, send DONE with no detection
                 Serial.printf("[SCAN] No detection after %d attempts — giving up\n", g_scan_retries);
                 sendPoseUpdate(1);
+                portENTER_CRITICAL(&g_scan_mux);
                 g_scan_state = SCAN_SLEEP;
+                portEXIT_CRITICAL(&g_scan_mux);
                 g_stable_count = 0;
                 g_scan_frame_count = 0;
                 g_scan_retries = 0;
@@ -1610,7 +1614,10 @@ void setup() {
                     // Sleep until scan request wakes us
                     if (g_scan_state == SCAN_SLEEP) {
                         xSemaphoreTake(g_scan_wake_sem, portMAX_DELAY);
-                        // Woken — initialize scan state
+                        // Woken — transition to ACTIVE and initialize scan state
+                        portENTER_CRITICAL(&g_scan_mux);
+                        g_scan_state = SCAN_ACTIVE;
+                        portEXIT_CRITICAL(&g_scan_mux);
                         g_scan_start_ms = millis();
                         g_scan_frame_count = 0;
                         g_stable_count = 0;
@@ -1626,8 +1633,14 @@ void setup() {
                     }
 
                     // Handle mid-scan restart (set by ESP-NOW callback)
+                    bool need_restart = false;
+                    portENTER_CRITICAL(&g_scan_mux);
                     if (g_scan_restart) {
                         g_scan_restart = false;
+                        need_restart = true;
+                    }
+                    portEXIT_CRITICAL(&g_scan_mux);
+                    if (need_restart) {
                         g_scan_start_ms = millis();
                         g_scan_frame_count = 0;
                         g_stable_count = 0;

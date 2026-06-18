@@ -1,34 +1,37 @@
-// =========================== BASE ESP32 (WiFi AP + HTTP + ESP-NOW) ===========================
-// Phone → WiFi "GLITCH" → http://192.168.4.1 → HTTP POST → ESP-NOW → Arm/Camera
+// =========================== BASE ESP32 (WiFi AP + HTTP + ESP-NOW)
+// =========================== Phone → WiFi "GLITCH" → http://192.168.4.1 → HTTP
+// POST → ESP-NOW → Arm/Camera
 
-#include <WiFi.h>
+#include "MPU6050_6Axis_MotionApps20.h"
 #include <WebServer.h>
-#include <esp_wifi.h>
-#include <math.h>
+#include <WiFi.h>
 #include <Wire.h>
 #include <esp_now.h>
-#include "MPU6050_6Axis_MotionApps20.h"
+#include <esp_wifi.h>
+#include <math.h>
+
 
 // ================= WIFI AP =================
-const char* AP_SSID = "GLITCH";
-const char* AP_PASS = "Gl1tch2024!Secure";
+const char *AP_SSID = "GLITCH";
+const char *AP_PASS = "Gl1tch2024!Secure";
 const uint8_t WIFI_CHANNEL = 11;
 
 // ================= WEB SERVER =================
 WebServer server(80);
 
 // ================= DEAD RECKONING (ENCODER-BASED) =================
-float posX = 0, posY = 0;  // global position in mm
-float velX = 0, velY = 0;  // filtered velocity in mm/s
-float currentSpeed = 0;     // filtered scalar speed mm/s
-float speedKmh = 0;         // filtered speed in km/h
+float posX = 0, posY = 0; // global position in mm
+float velX = 0, velY = 0; // filtered velocity in mm/s
+float currentSpeed = 0;   // filtered scalar speed mm/s
+float speedKmh = 0;       // filtered speed in km/h
 int32_t lastEncoders[4] = {0, 0, 0, 0};
 unsigned long lastEncoderMs = 0;
 bool encodersInitialized = false;
 // 1980 ticks/rev, 80mm wheel diameter
 const float TICKS_PER_REV = 1980.0f;
 const float WHEEL_DIA_MM = 80.0f;
-const float MM_PER_TICK = (PI * WHEEL_DIA_MM) / TICKS_PER_REV;  // ~0.1269 mm/tick
+const float MM_PER_TICK =
+    (PI * WHEEL_DIA_MM) / TICKS_PER_REV; // ~0.1269 mm/tick
 // EMA filter (0 < alpha < 1, lower = smoother)
 const float EMA_ALPHA = 0.15f;
 
@@ -52,35 +55,36 @@ typedef struct struct_message {
 struct_message armMessage;
 
 // =================== CAMERA ESP-NOW ===================
-static uint8_t cameraAddress[] = {0x94, 0xA9, 0x90, 0x08, 0xB2, 0xB8}; // must match camera's WiFi STA MAC
+static uint8_t cameraAddress[] = {
+    0x94, 0xA9, 0x90, 0x08, 0xB2, 0xB8}; // must match camera's WiFi STA MAC
 
 // ESP-NOW packet types (must match camera firmware)
 enum EspNowPacketType : uint8_t {
-  ESPNOW_TYPE_SCAN_REQ   = 0x20,
+  ESPNOW_TYPE_SCAN_REQ = 0x20,
   ESPNOW_TYPE_POSE_REPLY = 0x30,
 };
 
 // ESP-NOW packet: Base → Camera (scan request)
 struct __attribute__((packed)) ScanRequest {
-  uint8_t type;        // ESPNOW_TYPE_SCAN_REQ (0x20)
+  uint8_t type; // ESPNOW_TYPE_SCAN_REQ (0x20)
   uint8_t task_id;
-  uint8_t mode;        // 0=scan_qr, 1=scan_platform
+  uint8_t mode; // 0=scan_qr, 1=scan_platform
   uint8_t reserved;
 };
 
 // ESP-NOW packet: Camera → Base (pose reply)
 struct __attribute__((packed)) PoseReply {
-  uint8_t type;        // ESPNOW_TYPE_POSE_REPLY (0x30)
+  uint8_t type; // ESPNOW_TYPE_POSE_REPLY (0x30)
   uint8_t task_id;
   uint8_t pose_valid;
-  uint8_t color;       // 0=unknown, 1=R, 2=G, 3=B
+  uint8_t color; // 0=unknown, 1=R, 2=G, 3=B
   uint8_t estimated;
   float tx_mm;
   float ty_mm;
   float tz_mm;
   float yaw_deg;
   float confidence;
-  uint8_t status;      // 0=Accumulating, 1=DONE
+  uint8_t status; // 0=Accumulating, 1=DONE
 };
 
 // ESP-NOW packet: Base → Arm (camera pose data for guided IK)
@@ -98,8 +102,8 @@ struct __attribute__((packed)) CameraPoseData {
 
 // ESP-NOW packet: Arm → Base (busy/idle status)
 struct __attribute__((packed)) ArmStatus {
-  uint8_t type;   // 0 = status
-  uint8_t busy;   // 1 = busy, 0 = idle
+  uint8_t type; // 0 = status
+  uint8_t busy; // 1 = busy, 0 = idle
   uint8_t pad[2];
 };
 
@@ -120,14 +124,15 @@ static volatile uint32_t espNowRecvNoMatch = 0;
 
 // Scan progress tracking
 static volatile bool scanInProgress = false;
-static volatile uint8_t lastScanStatus = 0;  // 0=Accumulating, 1=DONE
+static volatile uint8_t lastScanStatus = 0; // 0=Accumulating, 1=DONE
 static unsigned long scanStartMs = 0;
 static portMUX_TYPE camMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Last QR scan result (persists until new scan)
 static bool lastQrValid = false;
 static uint8_t lastQrColor = 0;
-static float lastQrTx = 0, lastQrTy = 0, lastQrTz = 0, lastQrYaw = 0, lastQrConf = 0;
+static float lastQrTx = 0, lastQrTy = 0, lastQrTz = 0, lastQrYaw = 0,
+             lastQrConf = 0;
 static bool newQrResult = false;
 
 // --- STEP MOVEMENT FLAG ---
@@ -143,6 +148,25 @@ const int8_t *moveVec = nullptr;
 int8_t moveSpeed = 0;
 float moveTargetHeading = 0;
 bool moveIsRotation = false;
+
+// --- ROBOT STATE ---
+String robotState = "Idle";
+
+const char *stateFromVector(const int8_t vec[]) {
+  if (vec[0] == 1 && vec[1] == -1 && vec[2] == -1 && vec[3] == 1)
+    return "Moving Forward";
+  if (vec[0] == -1 && vec[1] == 1 && vec[2] == 1 && vec[3] == -1)
+    return "Moving Backward";
+  if (vec[0] == -1 && vec[1] == -1 && vec[2] == -1 && vec[3] == -1)
+    return "Strafing Left";
+  if (vec[0] == 1 && vec[1] == 1 && vec[2] == 1 && vec[3] == 1)
+    return "Strafing Right";
+  if (vec[0] == 1 && vec[1] == -1 && vec[2] == 1 && vec[3] == -1)
+    return "Rotating CW";
+  if (vec[0] == -1 && vec[1] == 1 && vec[2] == -1 && vec[3] == 1)
+    return "Rotating CCW";
+  return "Moving Diagonal";
+}
 
 // --- I2C Registers ---
 #define I2C_ADDR 0x34
@@ -172,10 +196,10 @@ void updateDeadReckoning();
 void trackMovement(const int8_t vector[], float dist_mm);
 
 // --- CALIBRATED TICK CONSTANTS (Blynk values × 97/80, distance in meters) ---
-const float TICKS_FWD_BWD = 6717.25f;
-const float TICKS_STRAFE  = 7581.71f;
-const float TICKS_DIAG    = 9548.44f;
-const float TICKS_ROTATE  = 8730.00f;
+const float TICKS_FWD_BWD = 7463.611f; // updated by 100/90 factor
+const float TICKS_STRAFE = 7581.71f;
+const float TICKS_DIAG = 9548.44f;
+const float TICKS_ROTATE = 8730.00f;
 
 int8_t Motor_speed = 25;
 
@@ -221,20 +245,24 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 // ESP-NOW receive callback — JUST STORE DATA, no heavy operations
 // Runs in WiFi task — MUST return immediately.
 void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
-  if (!mac || !data || len < 1) return;
+  if (!mac || !data || len < 1)
+    return;
   bool fromArm = (memcmp(mac, armAddress, 6) == 0);
   bool fromCam = (memcmp(mac, cameraAddress, 6) == 0);
-  if (!fromArm && !fromCam) return;
+  if (!fromArm && !fromCam)
+    return;
 
   espNowRecvCount++;
   espNowRecvBytes += len;
-  if (fromCam && len == (int)sizeof(PoseReply) && data[0] == ESPNOW_TYPE_POSE_REPLY) {
+  if (fromCam && len == (int)sizeof(PoseReply) &&
+      data[0] == ESPNOW_TYPE_POSE_REPLY) {
     portENTER_CRITICAL(&camMux);
     memcpy((void *)&lastPoseReply, data, sizeof(PoseReply));
     portEXIT_CRITICAL(&camMux);
     cameraPoseReceived = true;
     lastScanStatus = lastPoseReply.status;
-    if (lastPoseReply.status == 1) scanInProgress = false;
+    if (lastPoseReply.status == 1)
+      scanInProgress = false;
     espNowRecvMatchPose++;
   } else if (fromArm && len == (int)sizeof(ArmStatus) && data[0] == 0) {
     memcpy((void *)&lastArmStatus, data, sizeof(ArmStatus));
@@ -269,10 +297,12 @@ void sendScanRequest(uint8_t mode) {
     scanInProgress = true;
     lastScanStatus = 0;
     scanStartMs = millis();
-    Serial.printf("[CAM] Scan request sent: task=%d mode=%d\n", req.task_id, req.mode);
+    Serial.printf("[CAM] Scan request sent: task=%d mode=%d\n", req.task_id,
+                  req.mode);
   } else {
     scanInProgress = false;
-    Serial.printf("[CAM] Scan request FAILED: task=%d mode=%d err=%d\n", req.task_id, req.mode, result);
+    Serial.printf("[CAM] Scan request FAILED: task=%d mode=%d err=%d\n",
+                  req.task_id, req.mode, result);
   }
 }
 
@@ -336,7 +366,9 @@ bool writeSpeeds(int8_t v1, int8_t v2, int8_t v3, int8_t v4) {
 }
 
 void updateMotors() {
-  if (!moveActive) return;
+  if (!moveActive)
+    return;
+  robotState = stateFromVector(moveVec);
   updateYaw();
   if (moveIsRotation) {
     writeSpeeds(constrain((int)moveSpeed * moveVec[0], -100, 100),
@@ -345,8 +377,10 @@ void updateMotors() {
                 constrain((int)moveSpeed * moveVec[3], -100, 100));
   } else {
     float yawError = moveTargetHeading - currentYaw;
-    if (yawError > 180) yawError -= 360;
-    if (yawError < -180) yawError += 360;
+    if (yawError > 180)
+      yawError -= 360;
+    if (yawError < -180)
+      yawError += 360;
     int8_t gyroCorr = (int8_t)constrain(yawError * KP_GYRO, -127.0f, 127.0f);
     writeSpeeds(constrain((int)(moveSpeed * moveVec[0]) + gyroCorr, -100, 100),
                 constrain((int)(moveSpeed * moveVec[1]) - gyroCorr, -100, 100),
@@ -357,6 +391,7 @@ void updateMotors() {
 
 void forceStop() {
   moveActive = false;
+  robotState = "Idle";
   for (int i = 0; i < 5; i++) {
     if (writeSpeeds(0, 0, 0, 0)) {
       break;
@@ -369,11 +404,12 @@ void forceStop() {
 // MECANUM WHEEL MIXING (for binary protocol compatibility)
 // ================================================================
 
-void computeMecanumSpeeds(int8_t throttle, int8_t steering, int8_t rotation, int8_t speeds[4]) {
-  int16_t fl =  (int16_t)throttle - (int16_t)steering + (int16_t)rotation;
+void computeMecanumSpeeds(int8_t throttle, int8_t steering, int8_t rotation,
+                          int8_t speeds[4]) {
+  int16_t fl = (int16_t)throttle - (int16_t)steering + (int16_t)rotation;
   int16_t fr = -(int16_t)throttle - (int16_t)steering + (int16_t)rotation;
   int16_t bl = -(int16_t)throttle + (int16_t)steering + (int16_t)rotation;
-  int16_t br =  (int16_t)throttle + (int16_t)steering + (int16_t)rotation;
+  int16_t br = (int16_t)throttle + (int16_t)steering + (int16_t)rotation;
   speeds[0] = (int8_t)constrain(fl, -100, 100);
   speeds[1] = (int8_t)constrain(fr, -100, 100);
   speeds[2] = (int8_t)constrain(bl, -100, 100);
@@ -402,6 +438,7 @@ void updateYaw() {
 
 void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
                     float tickConstant) {
+  robotState = stateFromVector(vector);
   int32_t startEncoders[4], currentEncoders[4];
   long targetTicks = lroundf(fabs(distance * tickConstant));
   int8_t localMinTorque = MIN_TORQUE;
@@ -438,7 +475,8 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
       } else {
         i2cErrors++;
         if (i2cErrors > 5) {
-          Serial.println("[ERR] I2C encoder read failed 5 times, aborting move");
+          Serial.println(
+              "[ERR] I2C encoder read failed 5 times, aborting move");
           break;
         }
       }
@@ -454,8 +492,10 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
       baseSpeed = (int8_t)constrain(calcSpeed, localMinTorque, maxSpeed);
 
     float yawError = targetHeading - currentYaw;
-    if (yawError > 180) yawError -= 360;
-    if (yawError < -180) yawError += 360;
+    if (yawError > 180)
+      yawError -= 360;
+    if (yawError < -180)
+      yawError += 360;
     int8_t gyroCorr = (int8_t)constrain(yawError * KP_GYRO, -127.0f, 127.0f);
 
     writeSpeeds(constrain((int)(baseSpeed * vector[0]) + gyroCorr, -100, 100),
@@ -474,20 +514,26 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
 }
 
 void rotateDegrees(bool clockwise, float degrees, int8_t maxSpeed) {
+  robotState = clockwise ? "Rotating CW" : "Rotating CCW";
   updateYaw();
   float startHeading = currentYaw;
-  float target = clockwise ? (startHeading + degrees) : (startHeading - degrees);
+  float target =
+      clockwise ? (startHeading + degrees) : (startHeading - degrees);
 
   while (true) {
     updateYaw();
     float yawError = target - currentYaw;
-    if (yawError > 180) yawError -= 360;
-    if (yawError < -180) yawError += 360;
+    if (yawError > 180)
+      yawError -= 360;
+    if (yawError < -180)
+      yawError += 360;
 
-    if (fabs(yawError) < 1.0f) break;
+    if (fabs(yawError) < 1.0f)
+      break;
 
     int8_t turnSpeed = (fabs(yawError) < 20.0f) ? 20 : maxSpeed;
-    if (yawError < 0) turnSpeed = -turnSpeed;
+    if (yawError < 0)
+      turnSpeed = -turnSpeed;
 
     writeSpeeds(turnSpeed * V_ROTATE_CW[0], turnSpeed * V_ROTATE_CW[1],
                 turnSpeed * V_ROTATE_CW[2], turnSpeed * V_ROTATE_CW[3]);
@@ -515,7 +561,8 @@ static bool waitForCameraPose(unsigned long timeout_ms, PoseReply *out) {
       memcpy(&reply, (const void *)&lastPoseReply, sizeof(reply));
       portEXIT_CRITICAL(&camMux);
       if (reply.status == 1 && reply.pose_valid) {
-        if (out) *out = reply;
+        if (out)
+          *out = reply;
         return true;
       }
       // Partial update (status=0) — keep waiting for DONE
@@ -535,6 +582,7 @@ static void alignBurst(const int8_t *vec, int8_t speed, int durationMs) {
 }
 
 static bool alignToQR() {
+  robotState = "Aligning to QR";
   const float YAW_THRESHOLD_DEG = 6.0f;
   const float APPROACH_DISTANCE_MM = 200.0f;
   const float CONFIDENCE_THRESHOLD = 0.55f;
@@ -547,8 +595,7 @@ static bool alignToQR() {
     return false;
 
   Serial.printf("[AUTO] Detected: color=%d conf=%.2f yaw=%.1f dist=%.0fmm\n",
-                pose.color, pose.confidence,
-                pose.yaw_deg, pose.tz_mm);
+                pose.color, pose.confidence, pose.yaw_deg, pose.tz_mm);
 
   for (int step = 0; step < MAX_ALIGN_STEPS; step++) {
     if (!autonomousMode)
@@ -575,8 +622,8 @@ static bool alignToQR() {
       return false;
   }
   forceStop();
-  Serial.printf("[AUTO] Approach complete: dist=%.0fmm conf=%.2f\n",
-                pose.tz_mm, pose.confidence);
+  Serial.printf("[AUTO] Approach complete: dist=%.0fmm conf=%.2f\n", pose.tz_mm,
+                pose.confidence);
 
   if (pose.confidence < CONFIDENCE_THRESHOLD) {
     Serial.println("[AUTO] Low confidence, aborting pickup");
@@ -592,13 +639,15 @@ static bool alignToQR() {
 // Blocks until arm finishes current command (busy -> idle transition).
 // Returns true if arm went idle, false on timeout or autonomousMode=false.
 static bool waitForArmIdle(unsigned long timeout_ms) {
-  delay(300);  // Give arm time to receive command and go busy
+  delay(300); // Give arm time to receive command and go busy
   unsigned long t0 = millis();
   while (millis() - t0 < timeout_ms) {
-    if (!autonomousMode) return false;
+    if (!autonomousMode)
+      return false;
     ArmStatus st;
     memcpy(&st, (const void *)&lastArmStatus, sizeof(st));
-    if (!st.busy) return true;
+    if (!st.busy)
+      return true;
     server.handleClient();
     updateYaw();
     updateDeadReckoning();
@@ -613,10 +662,12 @@ static bool waitForArmIdle(unsigned long timeout_ms) {
 // ================================================================
 
 static void servoStep(int idx, int dir) {
-  if (idx < 0 || idx > 3) return;
+  if (idx < 0 || idx > 3)
+    return;
   float newAng = servoAngle[idx] + (float)(dir * SERVO_STEP_DEG[idx]);
   newAng = constrain(newAng, 0.0f, 180.0f);
-  if (newAng == servoAngle[idx]) return;
+  if (newAng == servoAngle[idx])
+    return;
   char cmd[10];
   snprintf(cmd, sizeof(cmd), "SV:%d:%d", idx, (int)round(newAng));
   sendCommandToArm(cmd);
@@ -628,12 +679,16 @@ static void servoStep(int idx, int dir) {
 // COLOR NAME HELPER
 // ================================================================
 
-const char* colorName(uint8_t c) {
+const char *colorName(uint8_t c) {
   switch (c) {
-    case 1: return "RED";
-    case 2: return "GREEN";
-    case 3: return "BLUE";
-    default: return "NONE";
+  case 1:
+    return "RED";
+  case 2:
+    return "GREEN";
+  case 3:
+    return "BLUE";
+  default:
+    return "NONE";
   }
 }
 
@@ -645,18 +700,23 @@ const char* colorName(uint8_t c) {
 String jsonStr(const String &s, const String &key) {
   String k = "\"" + key + "\"";
   int p = s.indexOf(k);
-  if (p < 0) return "";
+  if (p < 0)
+    return "";
   p = s.indexOf(':', p);
-  if (p < 0) return "";
+  if (p < 0)
+    return "";
   p++;
-  while (p < (int)s.length() && s[p] == ' ') p++;
-  if (p >= (int)s.length()) return "";
+  while (p < (int)s.length() && s[p] == ' ')
+    p++;
+  if (p >= (int)s.length())
+    return "";
   if (s[p] == '"') {
     int e = s.indexOf('"', p + 1);
     return s.substring(p + 1, e);
   }
   int e = p;
-  while (e < (int)s.length() && s[e] != ',' && s[e] != '}' && s[e] != ' ') e++;
+  while (e < (int)s.length() && s[e] != ',' && s[e] != '}' && s[e] != ' ')
+    e++;
   return s.substring(p, e);
 }
 
@@ -674,16 +734,26 @@ void handleCommand(const String &msg) {
       }
       bool isRotation = (arg == "ROTCW" || arg == "ROTCCW");
       const int8_t *vec = nullptr;
-      if (arg == "FWD")        vec = V_FORWARD;
-      else if (arg == "BACK")  vec = V_BACKWARD;
-      else if (arg == "LEFT")  vec = V_STRAFE_L;
-      else if (arg == "RIGHT") vec = V_STRAFE_R;
-      else if (arg == "ROTCW") vec = V_ROTATE_CW;
-      else if (arg == "ROTCCW") vec = V_ROTATE_CCW;
-      else if (arg == "DIAGFR") vec = V_DIAG_FR;
-      else if (arg == "DIAGFL") vec = V_DIAG_FL;
-      else if (arg == "DIAGBR") vec = V_DIAG_BR;
-      else if (arg == "DIAGBL") vec = V_DIAG_BL;
+      if (arg == "FWD")
+        vec = V_FORWARD;
+      else if (arg == "BACK")
+        vec = V_BACKWARD;
+      else if (arg == "LEFT")
+        vec = V_STRAFE_L;
+      else if (arg == "RIGHT")
+        vec = V_STRAFE_R;
+      else if (arg == "ROTCW")
+        vec = V_ROTATE_CW;
+      else if (arg == "ROTCCW")
+        vec = V_ROTATE_CCW;
+      else if (arg == "DIAGFR")
+        vec = V_DIAG_FR;
+      else if (arg == "DIAGFL")
+        vec = V_DIAG_FL;
+      else if (arg == "DIAGBR")
+        vec = V_DIAG_BR;
+      else if (arg == "DIAGBL")
+        vec = V_DIAG_BL;
 
       if (vec) {
         moveVec = vec;
@@ -693,6 +763,7 @@ void handleCommand(const String &msg) {
           updateYaw();
           moveTargetHeading = currentYaw;
         }
+        robotState = stateFromVector(vec);
         moveActive = true;
       }
     }
@@ -701,26 +772,31 @@ void handleCommand(const String &msg) {
       pendingStep = true;
       stepArg = arg;
     }
+  } else if (cmd == "ROTATE90") {
+    if (!autonomousMode && !pendingStep) {
+      pendingStep = true;
+      stepArg = (arg == "CCW") ? "ROT90CCW" : "ROT90CW";
+    }
   } else if (cmd == "SPEED") {
     Motor_speed = (int8_t)constrain(arg.toInt(), 0, 100);
     Serial.printf("Motor Speed Updated: %d\n", Motor_speed);
-    } else if (cmd == "ARM") {
-      if (arg == "HOME") {
-        sendCommandToArm("H");
-      } else if (arg == "SCAN_POSE") {
-        sendCommandToArm("S");
-      } else if (arg == "CTP") {
-        sendCommandToArm("CTP");
-      } else if (arg == "CAM_PICKUP") {
-        // Step 1: Move arm home so camera is at known fixed position
-        sendCommandToArm("H");
-        Serial.println("[CAM] Camera guided pickup: homing arm...");
-        delay(3000);
-        // Step 2: Start QR scan; when result arrives, loop() auto-forwards to arm
-        camPickupPending = true;
-        newQrResult = false;
-        sendScanRequest(0);
-        Serial.println("[CAM] Scan started, waiting for result...");
+  } else if (cmd == "ARM") {
+    if (arg == "HOME") {
+      sendCommandToArm("H");
+    } else if (arg == "SCAN_POSE") {
+      sendCommandToArm("S");
+    } else if (arg == "CTP") {
+      sendCommandToArm("CTP");
+    } else if (arg == "CAM_PICKUP") {
+      // Step 1: Move arm home so camera is at known fixed position
+      sendCommandToArm("H");
+      Serial.println("[CAM] Camera guided pickup: homing arm...");
+      delay(3000);
+      // Step 2: Start QR scan; when result arrives, loop() auto-forwards to arm
+      camPickupPending = true;
+      newQrResult = false;
+      sendScanRequest(0);
+      Serial.println("[CAM] Scan started, waiting for result...");
     } else {
       sendCommandToArm(arg.c_str());
     }
@@ -743,20 +819,22 @@ void handleCommand(const String &msg) {
       Serial.println("MANUAL MODE");
     }
     forceStop();
-    } else if (cmd == "SCAN") {
-      if (arg == "QR") {
-        newQrResult = false;
-        sendScanRequest(0);
-        Serial.println("[SCAN] QR scan requested");
-      } else if (arg == "PLAT") {
-        newQrResult = false;
-        sendScanRequest(1);
-        Serial.println("[SCAN] Platform scan requested");
-      } else if (arg == "STOP") {
-        scanInProgress = false;
-        newQrResult = false;
-        Serial.println("[SCAN] Scan stopped by user");
-      }
+  } else if (cmd == "SCAN") {
+    if (arg == "QR") {
+      newQrResult = false;
+      robotState = "Scanning QR";
+      sendScanRequest(0);
+      Serial.println("[SCAN] QR scan requested");
+    } else if (arg == "PLAT") {
+      newQrResult = false;
+      robotState = "Scanning Platform";
+      sendScanRequest(1);
+      Serial.println("[SCAN] Platform scan requested");
+    } else if (arg == "STOP") {
+      scanInProgress = false;
+      newQrResult = false;
+      Serial.println("[SCAN] Scan stopped by user");
+    }
   } else if (cmd == "SERVO") {
     int idx = arg.substring(0, arg.indexOf(':')).toInt();
     String dirStr = arg.substring(arg.indexOf(':') + 1);
@@ -774,21 +852,32 @@ void trackMovement(const int8_t vector[], float dist_mm) {
   // Determine robot-frame displacement from mecanum vector
   float dx_r = 0, dy_r = 0;
   if (vector[0] == 1 && vector[1] == -1 && vector[2] == -1 && vector[3] == 1) {
-    dx_r = dist_mm;   // FORWARD
-  } else if (vector[0] == -1 && vector[1] == 1 && vector[2] == 1 && vector[3] == -1) {
-    dx_r = -dist_mm;  // BACKWARD
-  } else if (vector[0] == -1 && vector[1] == -1 && vector[2] == -1 && vector[3] == -1) {
-    dy_r = dist_mm;   // STRAFE LEFT
-  } else if (vector[0] == 1 && vector[1] == 1 && vector[2] == 1 && vector[3] == 1) {
-    dy_r = -dist_mm;  // STRAFE RIGHT
-  } else if (vector[0] == -1 && vector[1] == 1 && vector[2] == -1 && vector[3] == 1) {
-    dx_r = dist_mm; dy_r = dist_mm;   // DIAG FL
-  } else if (vector[0] == 1 && vector[1] == 1 && vector[2] == -1 && vector[3] == -1) {
-    dx_r = dist_mm; dy_r = -dist_mm;  // DIAG FR
-  } else if (vector[0] == -1 && vector[1] == -1 && vector[2] == 1 && vector[3] == 1) {
-    dx_r = -dist_mm; dy_r = dist_mm;  // DIAG BL
-  } else if (vector[0] == 1 && vector[1] == -1 && vector[2] == 1 && vector[3] == -1) {
-    dx_r = -dist_mm; dy_r = -dist_mm; // DIAG BR
+    dx_r = dist_mm; // FORWARD
+  } else if (vector[0] == -1 && vector[1] == 1 && vector[2] == 1 &&
+             vector[3] == -1) {
+    dx_r = -dist_mm; // BACKWARD
+  } else if (vector[0] == -1 && vector[1] == -1 && vector[2] == -1 &&
+             vector[3] == -1) {
+    dy_r = dist_mm; // STRAFE LEFT
+  } else if (vector[0] == 1 && vector[1] == 1 && vector[2] == 1 &&
+             vector[3] == 1) {
+    dy_r = -dist_mm; // STRAFE RIGHT
+  } else if (vector[0] == -1 && vector[1] == 1 && vector[2] == -1 &&
+             vector[3] == 1) {
+    dx_r = dist_mm;
+    dy_r = dist_mm; // DIAG FL
+  } else if (vector[0] == 1 && vector[1] == 1 && vector[2] == -1 &&
+             vector[3] == -1) {
+    dx_r = dist_mm;
+    dy_r = -dist_mm; // DIAG FR
+  } else if (vector[0] == -1 && vector[1] == -1 && vector[2] == 1 &&
+             vector[3] == 1) {
+    dx_r = -dist_mm;
+    dy_r = dist_mm; // DIAG BL
+  } else if (vector[0] == 1 && vector[1] == -1 && vector[2] == 1 &&
+             vector[3] == -1) {
+    dx_r = -dist_mm;
+    dy_r = -dist_mm; // DIAG BR
   } else {
     return; // unknown vector
   }
@@ -808,12 +897,14 @@ void trackMovement(const int8_t vector[], float dist_mm) {
 void updateDeadReckoning() {
   unsigned long now = millis();
   float dt = (now - lastEncoderMs) / 1000.0f;
-  if (dt < 0.02f) return;  // max 50Hz
-  if (dt > 0.5f) {         // first call or long gap — just initialize
+  if (dt < 0.02f)
+    return;        // max 50Hz
+  if (dt > 0.5f) { // first call or long gap — just initialize
     lastEncoderMs = now;
     int32_t enc[4];
     if (readEncoders(enc)) {
-      for (int i = 0; i < 4; i++) lastEncoders[i] = enc[i];
+      for (int i = 0; i < 4; i++)
+        lastEncoders[i] = enc[i];
       encodersInitialized = true;
     }
     return;
@@ -821,9 +912,11 @@ void updateDeadReckoning() {
   lastEncoderMs = now;
 
   int32_t enc[4];
-  if (!readEncoders(enc)) return;
+  if (!readEncoders(enc))
+    return;
   if (!encodersInitialized) {
-    for (int i = 0; i < 4; i++) lastEncoders[i] = enc[i];
+    for (int i = 0; i < 4; i++)
+      lastEncoders[i] = enc[i];
     encodersInitialized = true;
     return;
   }
@@ -849,7 +942,7 @@ void updateDeadReckoning() {
   velY = EMA_ALPHA * rawVy + (1.0f - EMA_ALPHA) * velY;
   float rawSpeed = sqrtf(rawVx * rawVx + rawVy * rawVy);
   currentSpeed = EMA_ALPHA * rawSpeed + (1.0f - EMA_ALPHA) * currentSpeed;
-  speedKmh = currentSpeed * 0.0036f;  // mm/s -> km/h
+  speedKmh = currentSpeed * 0.0036f; // mm/s -> km/h
 
   // Rotate to global frame using current heading (updateYaw called from loop())
   float heading_rad = currentYaw * PI / 180.0f;
@@ -980,8 +1073,13 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         </div>
         <div class="section-label" style="margin-top:14px">Motor Speed</div>
         <div class="slider-row">
-            <input type="range" id="speed" min="0" max="80" value="25">
+            <input type="range" id="speed" min="0" max="100" value="25">
             <span class="val" id="speedVal">25</span>
+        </div>
+        <div class="section-label" style="margin-top:14px">Quick Rotate 90&deg;</div>
+        <div class="grid-2">
+            <button id="btnRot90CCW" data-cmd="ROTATE90" data-arg="CCW">90&deg; &#8634;</button>
+            <button id="btnRot90CW"  data-cmd="ROTATE90" data-arg="CW">90&deg; &#8635;</button>
         </div>
     </div>
 
@@ -1038,13 +1136,6 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
             <div class="tile"><div class="label">Confidence</div><div class="val" id="camConf">--</div></div>
             <div class="tile"><div class="label">Pose (x,y,z)</div><div class="val small" id="camPose">--</div></div>
         </div>
-    </div>
-
-    <div class="card">
-        <h2>Event Log</h2>
-        <div class="log" id="log"></div>
-    </div>
-    </div>
     </div>
 
     <div class="card">
@@ -1153,7 +1244,7 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
             if(b.closest('.pad')||b.id==='btnScanQR')return;
             b.addEventListener('click',function(){send({cmd:b.dataset.cmd,arg:b.dataset.arg})});
         });
-        $('btnAuto').addEventListener('click',function(){$('btnAuto').classList.toggle('active')});
+        // btnAuto handled by generic data-cmd handler + pollStatus()
         $('btnScanQR').addEventListener('click',function(){
             if(scanActive){
                 send({cmd:'SCAN',arg:'STOP'});
@@ -1255,6 +1346,18 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-seri
 .mode-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;font-family:monospace;letter-spacing:1px}
 .mode-auto{background:rgba(251,191,36,0.2);color:#fbbf24;border:1px solid rgba(251,191,36,0.4)}
 .mode-manual{background:rgba(52,211,153,0.2);color:#34d399;border:1px solid rgba(52,211,153,0.4)}
+.state-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;font-family:monospace;letter-spacing:1px;margin-left:6px}
+.state-idle{background:rgba(148,163,184,0.2);color:#94a3b8;border:1px solid rgba(148,163,184,0.4)}
+.state-moving{background:rgba(56,189,248,0.2);color:#38bdf8;border:1px solid rgba(56,189,248,0.4)}
+.state-rotating{background:rgba(251,146,60,0.2);color:#fb923c;border:1px solid rgba(251,146,60,0.4)}
+.state-scanning{background:rgba(168,85,247,0.2);color:#a855f7;border:1px solid rgba(168,85,247,0.4)}
+.state-arm{background:rgba(236,72,153,0.2);color:#ec4899;border:1px solid rgba(236,72,153,0.4)}
+.qr-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.qr-tile{background:#1a1a2a;border-radius:6px;padding:8px}
+.qr-tile .lbl{font-size:9px;color:#666;text-transform:uppercase;letter-spacing:0.5px}
+.qr-tile .vl{font-family:'Courier New',monospace;font-size:14px;font-weight:700;color:#0af;margin-top:1px}
+.qr-tile .vl.sm{font-size:12px}
+.qr-msg{grid-column:span 2;background:#1a1a2a;border-radius:6px;padding:8px;font-family:'Courier New',monospace;font-size:12px;color:#a855f7;text-align:center;min-height:32px;display:flex;align-items:center;justify-content:center}
 </style>
 </head>
 <body>
@@ -1273,7 +1376,7 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-seri
     <div class="panel">
       <div class="hdr">
         <h3>Status</h3>
-        <span class="mode-badge mode-manual" id="modeBadge">MANUAL</span>
+        <span><span class="mode-badge mode-manual" id="modeBadge">MANUAL</span><span class="state-badge state-idle" id="stateBadge">Idle</span></span>
       </div>
       <div class="info-row3">
         <div class="stat"><div class="val sm" id="posX">0.0</div><div class="lbl">X (mm)</div></div>
@@ -1284,6 +1387,18 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-seri
         <div class="stat"><div class="val sm" id="velX">0</div><div class="lbl">Vx (km/h)</div></div>
         <div class="stat"><div class="val sm" id="velY">0</div><div class="lbl">Vy (km/h)</div></div>
         <div class="stat"><div class="val sm" id="speed">0</div><div class="lbl">Speed (km/h)</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>QR Code Results</h3>
+      <div class="qr-grid">
+        <div class="qr-tile"><div class="lbl">Color</div><div class="vl" id="qrColor">--</div></div>
+        <div class="qr-tile"><div class="lbl">Confidence</div><div class="vl" id="qrConf">--</div></div>
+        <div class="qr-tile"><div class="lbl">Pose X (mm)</div><div class="vl sm" id="qrTx">--</div></div>
+        <div class="qr-tile"><div class="lbl">Pose Y (mm)</div><div class="vl sm" id="qrTy">--</div></div>
+        <div class="qr-tile"><div class="lbl">Distance (mm)</div><div class="vl sm" id="qrTz">--</div></div>
+        <div class="qr-tile"><div class="lbl">Yaw (deg)</div><div class="vl sm" id="qrYaw">--</div></div>
+        <div class="qr-msg" id="qrMsg">No QR scanned</div>
       </div>
     </div>
     <div class="panel">
@@ -1354,6 +1469,32 @@ function pollStatus(){
     var mb=document.getElementById('modeBadge');
     if(autoMode){mb.textContent='AUTONOMOUS';mb.className='mode-badge mode-auto';}
     else{mb.textContent='MANUAL';mb.className='mode-badge mode-manual';}
+
+    var st=d.robot_state||'Idle';
+    var sb=document.getElementById('stateBadge');
+    sb.textContent=st;
+    sb.className='state-badge';
+    if(st==='Idle')sb.classList.add('state-idle');
+    else if(st.indexOf('Rotating')>=0)sb.classList.add('state-rotating');
+    else if(st.indexOf('Scanning')>=0||st.indexOf('Aligning')>=0)sb.classList.add('state-scanning');
+    else if(st.indexOf('Arm')>=0)sb.classList.add('state-arm');
+    else sb.classList.add('state-moving');
+
+    if(d.qr_result){
+      var qr=d.qr_result;
+      document.getElementById('qrColor').textContent=qr.color_name||'--';
+      document.getElementById('qrConf').textContent=qr.confidence!=null?parseFloat(qr.confidence).toFixed(2):'--';
+      document.getElementById('qrTx').textContent=qr.tx_mm!=null?parseFloat(qr.tx_mm).toFixed(0):'--';
+      document.getElementById('qrTy').textContent=qr.ty_mm!=null?parseFloat(qr.ty_mm).toFixed(0):'--';
+      document.getElementById('qrTz').textContent=qr.tz_mm!=null?parseFloat(qr.tz_mm).toFixed(0):'--';
+      document.getElementById('qrYaw').textContent=qr.yaw_deg!=null?parseFloat(qr.yaw_deg).toFixed(1):'--';
+      document.getElementById('qrMsg').textContent=qr.qr_msg||'No text decoded';
+      if(qr.color_name&&qr.color_name!=='NONE'){
+        var cMap={'RED':'#ef4444','GREEN':'#22c55e','BLUE':'#3b82f6'};
+        document.getElementById('qrColor').style.color=cMap[qr.color_name]||'#0af';
+      }
+    }
+
     trail.push({x:posX,y:posY});
     if(trail.length>1000)trail.shift();
     drawMap();
@@ -1552,9 +1693,8 @@ void setup() {
   // ================= WEB SERVER =================
 
   // Serve controller page at root
-  server.on("/", HTTP_GET, []() {
-    server.send(200, "text/html", CONTROLLER_HTML);
-  });
+  server.on("/", HTTP_GET,
+            []() { server.send(200, "text/html", CONTROLLER_HTML); });
 
   // Status endpoint — polled by GUI every 500ms
   server.on("/status", HTTP_GET, []() {
@@ -1562,8 +1702,10 @@ void setup() {
     json += "\"arm_busy\":" + String(lastArmStatus.busy ? "true" : "false");
     json += ",\"autonomous\":" + String(autonomousMode ? "true" : "false");
     json += ",\"qr_pending\":" + String(newQrResult ? "false" : "true");
-    json += ",\"scan_in_progress\":" + String(scanInProgress ? "true" : "false");
-    json += ",\"scan_status\":\"" + String(scanInProgress ? "Accumulating" : "DONE") + "\"";
+    json +=
+        ",\"scan_in_progress\":" + String(scanInProgress ? "true" : "false");
+    json += ",\"scan_status\":\"" +
+            String(scanInProgress ? "Accumulating" : "DONE") + "\"";
     json += ",\"current_yaw\":" + String(currentYaw, 1);
 
     if (newQrResult) {
@@ -1577,7 +1719,8 @@ void setup() {
       json += ",\"tz_mm\":" + String(lastQrTz, 0);
       json += ",\"yaw_deg\":" + String(lastQrYaw, 1);
       json += ",\"qr_msg\":\"QR Color " + String(colorName(lastQrColor)) + "\"";
-      json += ",\"scan_status\":\"" + String(lastScanStatus == 1 ? "DONE" : "Accumulating") + "\"";
+      json += ",\"scan_status\":\"" +
+              String(lastScanStatus == 1 ? "DONE" : "Accumulating") + "\"";
       json += "}";
     }
     json += "}";
@@ -1594,9 +1737,8 @@ void setup() {
   });
 
   // Dashboard page — display-only monitoring
-  server.on("/dashboard", HTTP_GET, []() {
-    server.send(200, "text/html", DASHBOARD_HTML);
-  });
+  server.on("/dashboard", HTTP_GET,
+            []() { server.send(200, "text/html", DASHBOARD_HTML); });
 
   // Dashboard API — returns position, heading, velocity, mode as JSON
   server.on("/api/status", HTTP_GET, []() {
@@ -1608,7 +1750,28 @@ void setup() {
     json += ",\"velY\":" + String(velY * 0.0036f, 2);
     json += ",\"speed\":" + String(speedKmh, 2);
     json += ",\"autonomous\":" + String(autonomousMode ? "true" : "false");
-    json += ",\"mode\":\"" + String(autonomousMode ? "Autonomous" : "Manual") + "\"";
+    json += ",\"mode\":\"" + String(autonomousMode ? "Autonomous" : "Manual") +
+            "\"";
+    json += ",\"robot_state\":\"" + robotState + "\"";
+    json +=
+        ",\"scan_in_progress\":" + String(scanInProgress ? "true" : "false");
+    json += ",\"arm_busy\":" + String(lastArmStatus.busy ? "true" : "false");
+
+    if (newQrResult) {
+      json += ",\"qr_result\":{";
+      json += "\"pose_valid\":" + String(lastQrValid);
+      json += ",\"color\":" + String(lastQrColor);
+      json += ",\"color_name\":\"" + String(colorName(lastQrColor)) + "\"";
+      json += ",\"confidence\":" + String(lastQrConf, 2);
+      json += ",\"tx_mm\":" + String(lastQrTx, 0);
+      json += ",\"ty_mm\":" + String(lastQrTy, 0);
+      json += ",\"tz_mm\":" + String(lastQrTz, 0);
+      json += ",\"yaw_deg\":" + String(lastQrYaw, 1);
+      json += ",\"qr_msg\":\"QR Color " + String(colorName(lastQrColor)) + "\"";
+      json += ",\"scan_status\":\"" +
+              String(lastScanStatus == 1 ? "DONE" : "Accumulating") + "\"";
+      json += "}";
+    }
     json += "}";
     server.send(200, "application/json", json);
   });
@@ -1633,7 +1796,8 @@ void loop() {
   updateDeadReckoning();
 
   // =================== CONTINUOUS MOVEMENT ===================
-  if (!autonomousMode) updateMotors();
+  if (!autonomousMode)
+    updateMotors();
 
   // =================== SCAN TIMEOUT WATCHDOG ===================
   if (scanInProgress && millis() - scanStartMs > 40000) {
@@ -1651,8 +1815,8 @@ void loop() {
     portEXIT_CRITICAL(&camMux);
     Serial.printf(
         "[CAM] Pose: valid=%d color=%d conf=%.2f yaw=%.1f tz=%.1f est=%d\n",
-        reply.pose_valid, reply.color, reply.confidence,
-        reply.yaw_deg, reply.tz_mm, reply.estimated);
+        reply.pose_valid, reply.color, reply.confidence, reply.yaw_deg,
+        reply.tz_mm, reply.estimated);
     if (reply.status == 1 || (reply.pose_valid && reply.confidence > 0.0f)) {
       lastQrValid = reply.pose_valid;
       lastQrColor = reply.color;
@@ -1663,7 +1827,8 @@ void loop() {
       lastQrConf = reply.confidence;
       newQrResult = true;
     }
-    // Camera still accumulating — reset watchdog so base doesn't timeout mid-retry
+    // Camera still accumulating — reset watchdog so base doesn't timeout
+    // mid-retry
     if (reply.status == 0) {
       scanStartMs = millis();
     }
@@ -1676,7 +1841,8 @@ void loop() {
   }
 
   // =================== CAMERA GUIDED PICKUP AUTO-TRIGGER ===================
-  // When scan completes with a valid result, auto-forward pose to arm for IK pickup
+  // When scan completes with a valid result, auto-forward pose to arm for IK
+  // pickup
   if (camPickupPending && newQrResult) {
     camPickupPending = false;
     if (lastQrValid) {
@@ -1711,6 +1877,10 @@ void loop() {
       moveDistanceKp(V_DIAG_BR, Motor_speed, stepDist, TICKS_DIAG);
     } else if (stepArg == "DIAGBL") {
       moveDistanceKp(V_DIAG_BL, Motor_speed, stepDist, TICKS_DIAG);
+    } else if (stepArg == "ROT90CW") {
+      rotateDegrees(true, 90.0, Motor_speed);
+    } else if (stepArg == "ROT90CCW") {
+      rotateDegrees(false, 90.0, Motor_speed);
     }
     pendingStep = false;
   }
@@ -1719,17 +1889,18 @@ void loop() {
   static unsigned long lastStatusUpdate = 0;
   if (millis() - lastStatusUpdate > 5000) {
     lastStatusUpdate = millis();
-    Serial.printf("[ESP-NOW RX] total=%lu bytes=%lu pose=%lu arm=%lu nomatch=%lu\n",
-      (unsigned long)espNowRecvCount, (unsigned long)espNowRecvBytes,
-      (unsigned long)espNowRecvMatchPose, (unsigned long)espNowRecvMatchArm,
-      (unsigned long)espNowRecvNoMatch);
+    Serial.printf(
+        "[ESP-NOW RX] total=%lu bytes=%lu pose=%lu arm=%lu nomatch=%lu\n",
+        (unsigned long)espNowRecvCount, (unsigned long)espNowRecvBytes,
+        (unsigned long)espNowRecvMatchPose, (unsigned long)espNowRecvMatchArm,
+        (unsigned long)espNowRecvNoMatch);
   }
 
   // =================== AUTONOMOUS SEQUENCE ===================
   // Fixed competition sequence — runs to completion once started.
   // To modify: change distances (meters), arm commands, or step order.
-  // Each step: movement (vector + distance in meters) or arm action (command + wait).
-  // Sequence: FWD 1m -> Red->Plat -> LEFT 1m -> BACK 1m -> Blue->Plat
+  // Each step: movement (vector + distance in meters) or arm action (command +
+  // wait). Sequence: FWD 1m -> Red->Plat -> LEFT 1m -> BACK 1m -> Blue->Plat
   //           -> RIGHT 1m -> Green->Plat -> DIAG 1m
   // Toggle autonomous OFF to stop mid-sequence.
   if (autonomousMode && autoTrigger == 1) {
@@ -1739,12 +1910,11 @@ void loop() {
     // --- Step 1: Move FORWARD 1 meter ---
     Serial.println("[AUTO] Step 1: Forward 1m");
     moveDistanceKp(V_FORWARD, Motor_speed, 1.0, TICKS_FWD_BWD);
-    if (!autonomousMode) goto autoEnd;
+    if (!autonomousMode)
+      goto autoEnd;
 
-    // --- Step 2: Drop RED box on platform ---
-    // Arm: pick from red pos, transit home (gripper closed), place at platform
-    Serial.println("[AUTO] Step 2: Red -> Platform");
-    sendCommandToArm("RTP");
+    /*
+    CommandToArm("RTP");
     waitForArmIdle(20000);
     if (!autonomousMode) goto autoEnd;
 
@@ -1778,9 +1948,9 @@ void loop() {
     // --- Step 8: Move DIAGONAL (forward-right) 1 meter ---
     Serial.println("[AUTO] Step 8: Diagonal 1m");
     moveDistanceKp(V_DIAG_FR, Motor_speed, 1.0, TICKS_DIAG);
-
+*/
     Serial.println("[AUTO] === Sequence complete ===");
-    autoEnd:
+  autoEnd:
     forceStop();
     autonomousMode = false;
     Serial.println("[AUTO] Autonomous sequence ended");
