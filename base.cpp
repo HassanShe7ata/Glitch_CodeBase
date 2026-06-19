@@ -549,6 +549,19 @@ void rotateDegrees(bool clockwise, float degrees, int8_t maxSpeed) {
   forceStop();
 }
 
+void rotateToHeading(float targetHeading, int8_t maxSpeed) {
+  robotState = "Rotating to pose";
+  updateYaw();
+  float startHeading = currentYaw;
+  float diff = targetHeading - startHeading;
+  while (diff > 180) diff -= 360;
+  while (diff < -180) diff += 360;
+  bool clockwise = (diff > 0);
+  float degrees = fabs(diff);
+  if (degrees < 1.0f) { forceStop(); return; }
+  rotateDegrees(clockwise, degrees, maxSpeed);
+}
+
 // ================================================================
 // AUTONOMOUS CAMERA ALIGNMENT
 // ================================================================
@@ -782,6 +795,11 @@ void handleCommand(const String &msg) {
     if (!autonomousMode && !pendingStep) {
       pendingStep = true;
       stepArg = (arg == "CCW") ? "ROT90CCW" : "ROT90CW";
+    }
+  } else if (cmd == "POSE") {
+    if (!autonomousMode && !pendingStep) {
+      pendingStep = true;
+      stepArg = "POSE:" + arg;
     }
   } else if (cmd == "SPEED") {
     Motor_speed = (int8_t)constrain(arg.toInt(), 0, 100);
@@ -1072,10 +1090,11 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
             <input type="range" id="speed" min="0" max="100" value="25">
             <span class="val" id="speedVal">25</span>
         </div>
-        <div class="section-label" style="margin-top:14px">Quick Rotate 90&deg;</div>
-        <div class="grid-2">
-            <button id="btnRot90CCW" data-cmd="ROTATE90" data-arg="CCW">90&deg; &#8634;</button>
-            <button id="btnRot90CW"  data-cmd="ROTATE90" data-arg="CW">90&deg; &#8635;</button>
+        <div class="section-label" style="margin-top:14px">Pose Heading</div>
+        <div class="grid-3">
+            <button data-cmd="POSE" data-arg="0">0&deg;</button>
+            <button data-cmd="POSE" data-arg="90">90&deg;</button>
+            <button data-cmd="POSE" data-arg="180">180&deg;</button>
         </div>
     </div>
 
@@ -1855,6 +1874,9 @@ void loop() {
       rotateDegrees(true, 90.0, Motor_speed);
     } else if (stepArg == "ROT90CCW") {
       rotateDegrees(false, 90.0, Motor_speed);
+    } else if (stepArg.startsWith("POSE:")) {
+      float targetHeading = stepArg.substring(5).toFloat();
+      rotateToHeading(targetHeading, Motor_speed);
     }
     pendingStep = false;
   }
