@@ -66,34 +66,44 @@ static bool starts_with_ci(const char *text, int text_len, const char *prefix) {
     return true;
 }
 
+static bool isAlphaAscii(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
 ArmColorCode arm_pose_color_from_text(const char *text, int text_len) {
     if (!text || text_len <= 0) {
         return ARM_COLOR_UNKNOWN;
     }
 
-    if (starts_with_ci(text, text_len, "R") || starts_with_ci(text, text_len, "RED")) {
-        return ARM_COLOR_R;
+    // Match full color words only (case-insensitive)
+    // Accepts: "RED", "RED-1", "RED BOX", but NOT "RIGHT", "REGREEN"
+    if (starts_with_ci(text, text_len, "RED")) {
+        // Ensure next char after "RED" is non-alpha or end of string
+        if (text_len == 3 || !isAlphaAscii(text[3]))
+            return ARM_COLOR_R;
     }
-    if (starts_with_ci(text, text_len, "G") || starts_with_ci(text, text_len, "GREEN")) {
-        return ARM_COLOR_G;
+    if (starts_with_ci(text, text_len, "GREEN")) {
+        if (text_len == 5 || !isAlphaAscii(text[5]))
+            return ARM_COLOR_G;
     }
-    if (starts_with_ci(text, text_len, "B") || starts_with_ci(text, text_len, "BLUE")) {
-        return ARM_COLOR_B;
+    if (starts_with_ci(text, text_len, "BLUE")) {
+        if (text_len == 4 || !isAlphaAscii(text[4]))
+            return ARM_COLOR_B;
     }
 
-    for (int i = 0; i < text_len; i++) {
-        char c = text[i];
-        if (c >= 'a' && c <= 'z') {
-            c = (char)(c - 'a' + 'A');
+    // Fallback: scan for standalone color words anywhere in text
+    for (int i = 0; i <= text_len - 3; i++) {
+        if (starts_with_ci(text + i, text_len - i, "RED")) {
+            if (i + 3 >= text_len || !isAlphaAscii(text[i + 3]))
+                return ARM_COLOR_R;
         }
-        if (c == 'R') {
-            return ARM_COLOR_R;
+        if (starts_with_ci(text + i, text_len - i, "GREEN")) {
+            if (i + 5 >= text_len || !isAlphaAscii(text[i + 5]))
+                return ARM_COLOR_G;
         }
-        if (c == 'G') {
-            return ARM_COLOR_G;
-        }
-        if (c == 'B') {
-            return ARM_COLOR_B;
+        if (starts_with_ci(text + i, text_len - i, "BLUE")) {
+            if (i + 4 >= text_len || !isAlphaAscii(text[i + 4]))
+                return ARM_COLOR_B;
         }
     }
 

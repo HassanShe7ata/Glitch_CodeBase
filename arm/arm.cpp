@@ -847,14 +847,6 @@ void loop() {
     sendArmStatus(false);
   }
 
-  // Handle camera-guided pickup (blocks but yields via executeSyncMove)
-  if (cameraPoseReady) {
-    cameraPoseReady = false;
-    sendArmStatus(true);
-    cameraGuidedPickup();
-    sendArmStatus(false);
-  }
-
   // If queue is empty, yield explicitly so the WiFi task gets CPU
   delay(10);
 }

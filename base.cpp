@@ -164,9 +164,6 @@ static bool newQrResult = false;
 bool pendingStep = false;
 String stepArg = "";
 
-// --- CAMERA GUIDED PICKUP FLAG ---
-bool camPickupPending = false;
-
 // --- CONTINUOUS MOVEMENT STATE ---
 bool moveActive = false;
 const int8_t *moveVec = nullptr;
@@ -796,16 +793,6 @@ void handleCommand(const String &msg) {
       sendCommandToArm("S");
     } else if (arg == "CTP") {
       sendCommandToArm("CTP");
-    } else if (arg == "CAM_PICKUP") {
-      // Step 1: Move arm home so camera is at known fixed position
-      sendCommandToArm("H");
-      Serial.println("[CAM] Camera guided pickup: homing arm...");
-      delay(3000);
-      // Step 2: Start QR scan; when result arrives, loop() auto-forwards to arm
-      camPickupPending = true;
-      newQrResult = false;
-      sendScanRequest(0);
-      Serial.println("[CAM] Scan started, waiting for result...");
     } else {
       sendCommandToArm(arg.c_str());
     }
@@ -1096,7 +1083,6 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         <h2>Arm</h2>
         <div class="grid-3" style="margin-bottom:10px;">
             <button data-cmd="ARM" data-arg="HOME" class="danger">Home</button>
-            <button data-cmd="ARM" data-arg="CAM_PICKUP" style="background:#8b5cf6;border-color:#8b5cf6;color:#fff">Camera Pickup</button>
             <button data-cmd="ARM" data-arg="CTP">Car &rarr; Plt</button>
         </div>
         <div class="section-label">To Platform</div>
@@ -1804,7 +1790,6 @@ void loop() {
   // =================== SCAN TIMEOUT WATCHDOG ===================
   if (scanInProgress && millis() - scanStartMs > 40000) {
     scanInProgress = false;
-    camPickupPending = false;
     Serial.println("[CAM] Scan timeout — forcing scanInProgress=false");
   }
 
@@ -1840,19 +1825,6 @@ void loop() {
     ArmStatus st;
     memcpy(&st, (const void *)&lastArmStatus, sizeof(st));
     Serial.printf("[ARM] Status: busy=%d\n", st.busy);
-  }
-
-  // =================== CAMERA GUIDED PICKUP AUTO-TRIGGER ===================
-  // When scan completes with a valid result, auto-forward pose to arm for IK
-  // pickup
-  if (camPickupPending && newQrResult) {
-    camPickupPending = false;
-    if (lastQrValid) {
-      sendCameraPoseToArm();
-      Serial.println("[CAM] Pose auto-forwarded to arm for IK pickup");
-    } else {
-      Serial.println("[CAM] Scan done but no valid pose — aborting pickup");
-    }
   }
 
   // =================== STEP HANDLER ===================
