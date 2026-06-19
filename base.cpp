@@ -4,6 +4,7 @@
 
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <WebServer.h>
+#include <WebSocketsServer.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <esp_now.h>
@@ -18,6 +19,23 @@ const uint8_t WIFI_CHANNEL = 11;
 
 // ================= WEB SERVER =================
 WebServer server(80);
+
+// ================= WEBSOCKET SERVER (fallback for ESP-NOW) =================
+static const uint16_t WS_PORT = 8080;
+static WebSocketsServer wsServer(WS_PORT);
+
+static void wsArmSendCommand(const char *cmd) {
+  // Send command to arm via WebSocket (binary, same struct as ESP-NOW)
+  struct { char command[10]; } armMsg;
+  strncpy(armMsg.command, cmd, 9);
+  armMsg.command[9] = '\0';
+  wsServer.sendBIN(0, (uint8_t *)&armMsg, sizeof(armMsg));
+  Serial.printf("[WS] Sent to arm: %s\n", cmd);
+}
+
+static void wsArmSendBIN(const uint8_t *data, size_t len) {
+  wsServer.sendBIN(0, data, len);
+}
 
 // ================= DEAD RECKONING (ENCODER-BASED) =================
 float posX = 0, posY = 0; // global position in mm
@@ -45,14 +63,7 @@ enum ArmColorCode : uint8_t {
 
 // ================= ESP NOW =================
 
-// Arm ESP32 MAC Address
-uint8_t armAddress[] = {0x68, 0xFE, 0x71, 0x12, 0x5D, 0xA8};
-
-typedef struct struct_message {
-  char command[10];
-} struct_message;
-
-struct_message armMessage;
+// Camera ESP32 MAC Address
 
 // =================== CAMERA ESP-NOW ===================
 static uint8_t cameraAddress[] = {
@@ -115,12 +126,26 @@ static volatile PoseReply lastPoseReply;
 static volatile bool armStatusReceived = false;
 static volatile ArmStatus lastArmStatus;
 
+// WebSocket event handler — receives arm status as fallback
+void onWsEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    Serial.printf("[WS] Arm connected: %d\n", num);
+  } else if (type == WStype_DISCONNECTED) {
+    Serial.printf("[WS] Arm disconnected: %d\n", num);
+  } else if (type == WStype_BIN && length >= 4) {
+    uint8_t pktType = payload[0];
+    if (pktType == 0 && length >= 4) {
+      memcpy((void *)&lastArmStatus, payload, sizeof(ArmStatus));
+      armStatusReceived = true;
+      Serial.printf("[WS-ARM] busy=%d\n", lastArmStatus.busy);
+    }
+  }
+}
+
 // ESP-NOW recv debug counter
 static volatile uint32_t espNowRecvCount = 0;
 static volatile uint32_t espNowRecvBytes = 0;
 static volatile uint32_t espNowRecvMatchPose = 0;
-static volatile uint32_t espNowRecvMatchArm = 0;
-static volatile uint32_t espNowRecvNoMatch = 0;
 
 // Scan progress tracking
 static volatile bool scanInProgress = false;
@@ -235,11 +260,11 @@ static float servoAngle[4] = {90.0f, 170.0f, 180.0f, 100.0f};
 
 // ESP-NOW send callback
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("ESP-NOW Send Status: ");
-  if (status == ESP_NOW_SEND_SUCCESS)
-    Serial.println("SUCCESS");
-  else
-    Serial.println("FAILED");
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    Serial.println("[ESP-NOW] Send SUCCESS");
+  } else {
+    Serial.println("[ESP-NOW] Send FAILED");
+  }
 }
 
 // ESP-NOW receive callback — JUST STORE DATA, no heavy operations
@@ -247,14 +272,13 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (!mac || !data || len < 1)
     return;
-  bool fromArm = (memcmp(mac, armAddress, 6) == 0);
   bool fromCam = (memcmp(mac, cameraAddress, 6) == 0);
-  if (!fromArm && !fromCam)
+  if (!fromCam)
     return;
 
   espNowRecvCount++;
   espNowRecvBytes += len;
-  if (fromCam && len == (int)sizeof(PoseReply) &&
+  if (len == (int)sizeof(PoseReply) &&
       data[0] == ESPNOW_TYPE_POSE_REPLY) {
     portENTER_CRITICAL(&camMux);
     memcpy((void *)&lastPoseReply, data, sizeof(PoseReply));
@@ -264,26 +288,12 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
     if (lastPoseReply.status == 1)
       scanInProgress = false;
     espNowRecvMatchPose++;
-  } else if (fromArm && len == (int)sizeof(ArmStatus) && data[0] == 0) {
-    memcpy((void *)&lastArmStatus, data, sizeof(ArmStatus));
-    armStatusReceived = true;
-    espNowRecvMatchArm++;
-  } else {
-    espNowRecvNoMatch++;
   }
 }
 
 void sendCommandToArm(const char *cmd) {
-  strncpy(armMessage.command, cmd, sizeof(armMessage.command) - 1);
-  armMessage.command[sizeof(armMessage.command) - 1] = '\0';
-  esp_err_t result =
-      esp_now_send(armAddress, (uint8_t *)&armMessage, sizeof(armMessage));
-  Serial.print("Sending Command -> ");
-  Serial.println(cmd);
-  if (result == ESP_OK)
-    Serial.println("Command Sent");
-  else
-    Serial.println("Error Sending Command");
+  wsArmSendCommand(cmd);
+  Serial.printf("[WS] Send to arm: %s\n", cmd);
 }
 
 void sendScanRequest(uint8_t mode) {
@@ -320,12 +330,11 @@ void sendCameraPoseToArm() {
   data.confidence = lastPoseReply.confidence;
   portEXIT_CRITICAL(&camMux);
 
-  esp_err_t result = esp_now_send(armAddress, (uint8_t *)&data, sizeof(data));
-  Serial.printf("[BASE] Camera pose forwarded to arm: valid=%d color=%d "
-                "tx=%.0f ty=%.0f tz=%.0f yaw=%.1f conf=%.2f (%s)\n",
+  wsArmSendBIN((uint8_t *)&data, sizeof(data));
+  Serial.printf("[WS] Camera pose forwarded to arm: valid=%d color=%d "
+                "tx=%.0f ty=%.0f tz=%.0f yaw=%.1f conf=%.2f\n",
                 data.pose_valid, data.color, data.tx_mm, data.ty_mm, data.tz_mm,
-                data.yaw_deg, data.confidence,
-                result == ESP_OK ? "OK" : "FAILED");
+                data.yaw_deg, data.confidence);
 }
 
 // ================================================================
@@ -1662,20 +1671,7 @@ void setup() {
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
 
-  // Add Arm peer
-  esp_now_peer_info_t armPeer = {};
-  memcpy(armPeer.peer_addr, armAddress, 6);
-  armPeer.channel = WIFI_CHANNEL;
-  armPeer.encrypt = false;
-  armPeer.ifidx = WIFI_IF_AP;
-
-  if (esp_now_add_peer(&armPeer) != ESP_OK) {
-    Serial.println("Failed to Add Arm Peer");
-  } else {
-    Serial.println("Arm ESP-NOW Peer Added");
-  }
-
-  // Add Camera peer
+  // Add Camera peer (ESP-NOW stays for camera only)
   esp_now_peer_info_t camPeer = {};
   memcpy(camPeer.peer_addr, cameraAddress, 6);
   camPeer.channel = WIFI_CHANNEL;
@@ -1688,7 +1684,7 @@ void setup() {
     Serial.println("Camera ESP-NOW Peer Added");
   }
 
-  Serial.println("ESP-NOW READY");
+  Serial.println("ESP-NOW READY (camera only)");
 
   // ================= WEB SERVER =================
 
@@ -1778,6 +1774,11 @@ void setup() {
 
   server.begin();
   Serial.println("Web server started on port 80");
+
+  wsServer.begin();
+  wsServer.onEvent(onWsEvent);
+  Serial.printf("WebSocket server started on port %d\n", WS_PORT);
+
   Serial.printf("Dashboard: http://%s/dashboard\n",
                 WiFi.softAPIP().toString().c_str());
 }
@@ -1788,6 +1789,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  wsServer.loop();
 
   // =================== IMU UPDATE (once per loop) ===================
   updateYaw();
@@ -1890,10 +1892,9 @@ void loop() {
   if (millis() - lastStatusUpdate > 5000) {
     lastStatusUpdate = millis();
     Serial.printf(
-        "[ESP-NOW RX] total=%lu bytes=%lu pose=%lu arm=%lu nomatch=%lu\n",
+        "[ESP-NOW RX] total=%lu bytes=%lu pose=%lu\n",
         (unsigned long)espNowRecvCount, (unsigned long)espNowRecvBytes,
-        (unsigned long)espNowRecvMatchPose, (unsigned long)espNowRecvMatchArm,
-        (unsigned long)espNowRecvNoMatch);
+        (unsigned long)espNowRecvMatchPose);
   }
 
   // =================== AUTONOMOUS SEQUENCE ===================

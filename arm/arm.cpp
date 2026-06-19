@@ -1,5 +1,6 @@
-// =========================== ARM ESP32 (ESP-NOW) ===========================
-// Receives commands via ESP-NOW from Base
+// =========================== ARM ESP32 (WebSocket) ===========================
+// Receives commands via WebSocket (TCP) from Base
+// Falls back to local AP+STA when base is offline.
 // Callback only enqueues; loop() dispatches — never block in callback.
 // WiFi reconnect is throttled; I2C errors logged.
 
@@ -7,7 +8,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <esp_now.h>
+#include <WebServer.h>
+#include <WebSocketsClient.h>
 #include <esp_wifi.h>
 #include <math.h>
 
@@ -19,7 +21,7 @@ struct JointAngles {
 };
 
 // ================= COMMAND QUEUE (ring buffer) =================
-// SPSC: writer = WiFi task (OnDataRecv), reader = loop().
+// SPSC: writer = WiFi/WebSocket task, reader = loop().
 // Uses portMUX spinlock for cross-core memory visibility on ESP32 dual-core.
 #define CMD_Q_DEPTH 8
 static char cmdQueue[CMD_Q_DEPTH][10];
@@ -54,7 +56,7 @@ static bool dequeueCmd(char *out) {
   return true;
 }
 
-// ================= ESP-NOW =================
+// ================= WEBSOCKET (PRIMARY) =================
 typedef struct {
   char command[10];
 } ArmCommand;
@@ -65,7 +67,7 @@ typedef struct __attribute__((packed)) {
   uint8_t pad[2];
 } ArmStatus;
 
-// Camera pose data forwarded by base via ESP-NOW
+// Camera pose data forwarded by base via WebSocket
 struct __attribute__((packed)) CameraPoseData {
   uint8_t type; // 1 = camera pose packet
   uint8_t pose_valid;
@@ -81,11 +83,166 @@ struct __attribute__((packed)) CameraPoseData {
 static volatile bool cameraPoseReady = false;
 static CameraPoseData incomingCameraPose;
 
-// ================= BASE MAC =================
-uint8_t baseAddress[6] = {0x80, 0xF3, 0xDA, 0x42, 0x3E, 0x5D}; // base AP MAC
+// ================= BASE WEBSOCKET =================
+static const char *BASE_WS_HOST = "192.168.4.1";
+static const uint16_t BASE_WS_PORT = 8080;
+static WebSocketsClient wsClient;
 
-// ================= ESP-NOW SEND STATS =================
-static volatile uint32_t espnowTxOk = 0, espnowTxFail = 0;
+// WebSocket event handler — receives commands and camera poses from base
+static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    Serial.println("[WS] Connected to base");
+  } else if (type == WStype_DISCONNECTED) {
+    Serial.println("[WS] Disconnected from base");
+  } else if (type == WStype_BIN && length >= 4) {
+    // Camera pose packet (24 bytes, type=1)
+    if (length == sizeof(CameraPoseData)) {
+      CameraPoseData pose;
+      memcpy(&pose, payload, sizeof(pose));
+      if (pose.type == 1 && pose.pose_valid) {
+        memcpy((void *)&incomingCameraPose, &pose, sizeof(pose));
+        cameraPoseReady = true;
+        Serial.printf("[WS-ARM] Camera pose: color=%d conf=%.2f "
+                      "qr=(%.0f,%.0f,%.0f)\n",
+                      pose.color, pose.confidence, pose.tx_mm, pose.ty_mm,
+                      pose.tz_mm);
+      }
+      return;
+    }
+    // Arm command (10 bytes)
+    if (length >= sizeof(ArmCommand)) {
+      ArmCommand msg;
+      memcpy(&msg, payload, sizeof(msg));
+      msg.command[9] = '\0';
+      if (enqueueCmd(msg.command))
+        Serial.printf("[WS-ARM] Q+: %s\n", msg.command);
+      else
+        Serial.println("[WS-ARM] Queue full — drop");
+    }
+  }
+}
+// ================= BASE WEBSOCKET =================
+
+// ================= LOCAL HTTP SERVER (fallback when base is off) =================
+static WebServer localServer(80);
+
+static const char ARM_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GLITCH-ARM</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:sans-serif;background:#111;color:#eee;text-align:center;padding:10px}
+h2{margin:8px 0;color:#0ff}
+.st{font-size:14px;margin:4px 0;color:#888}
+.on{color:#0f0}.off{color:#f44}
+table{margin:8px auto;border-spacing:6px}
+td{text-align:center}
+button{display:block;width:64px;height:48px;font-size:15px;font-weight:bold;border:none;border-radius:8px;cursor:pointer}
+.b{background:#333;color:#fff}.b:active{background:#555}
+.g{background:#0a0;color:#0f0}.g:active{background:#0f0;color:#000}
+.r{background:#a00;color:#f44}.r:active{background:#f44;color:#000}
+.bl{background:#006;color:#6bf}.bl:active{background:#06f;color:#fff}
+.y{background:#660;color:#ff0}.y:active{background:#ff0;color:#000}
+.p{background:#606;color:#f0f}.p:active{background:#f0f;color:#000}
+.sv{width:50px;height:36px;font-size:11px;background:#222;color:#aaa;border:1px solid #444}
+.sv:active{background:#555;color:#fff}
+</style></head><body>
+<h2>GLITCH-ARM</h2>
+<div class="st">WS: <span id="ws" class="off">DISCONNECTED</span></div>
+<div class="st">Base: <span id="base" class="off">OFFLINE</span></div>
+<table>
+<tr><td><button class="g" onclick="cmd('GTC')">GTC</button></td>
+<td><button class="bl" onclick="cmd('BTC')">BTC</button></td>
+<td><button class="r" onclick="cmd('RTC')">RTC</button></td></tr>
+<tr><td><button class="g" onclick="cmd('GTF')">GTF</button></td>
+<td><button class="bl" onclick="cmd('BTF')">BTF</button></td>
+<td><button class="r" onclick="cmd('RTF')">RTF</button></td></tr>
+<tr><td><button class="y" onclick="cmd('GTP')">GTP</button></td>
+<td><button class="p" onclick="cmd('BTP')">BTP</button></td>
+<td><button class="y" onclick="cmd('RTP')">RTP</button></td></tr>
+</table>
+<table>
+<tr><td><button class="g" onclick="cmd('CTP')">CTP</button></td>
+<td><button class="r" onclick="cmd('H')">HOME</button></td>
+<td><button class="b" onclick="cmd('S')">SCAN</button></td></tr>
+</table>
+<h2>Step Servos</h2>
+<div style="margin:6px 0">Size: <input type="number" id="stepSize" value="5" min="1" max="90" style="width:50px;background:#222;color:#eee;border:1px solid #444;border-radius:4px;padding:3px;text-align:center">&deg;</div>
+<table id="stepTable">
+<tr><td class="sv">S1</td><td><button class="sv step-btn" data-idx="0" data-dir="-1">-</button></td>
+<td><button class="sv step-btn" data-idx="0" data-dir="1">+</button></td></tr>
+<tr><td class="sv">S2</td><td><button class="sv step-btn" data-idx="1" data-dir="-1">-</button></td>
+<td><button class="sv step-btn" data-idx="1" data-dir="1">+</button></td></tr>
+<tr><td class="sv">S3</td><td><button class="sv step-btn" data-idx="2" data-dir="-1">-</button></td>
+<td><button class="sv step-btn" data-idx="2" data-dir="1">+</button></td></tr>
+<tr><td class="sv">S4</td><td><button class="sv step-btn" data-idx="3" data-dir="-1">-</button></td>
+<td><button class="sv step-btn" data-idx="3" data-dir="1">+</button></td></tr>
+<tr><td class="sv">Grip</td><td><button class="sv" onclick="cmd('SV:4:-5')">-</button></td>
+<td><button class="sv" onclick="cmd('SV:4:5')">+</button></td></tr>
+</table>
+<script>
+function cmd(c){fetch('/cmd?c='+c).then(r=>r.text()).then(t=>console.log(t))}
+function poll(){fetch('/status').then(r=>r.json()).then(d=>{
+document.getElementById('ws').className=d.ws?'on':'off';
+document.getElementById('ws').textContent=d.ws?'CONNECTED':'DISCONNECTED';
+document.getElementById('base').className=d.base?'on':'off';
+document.getElementById('base').textContent=d.base?'ONLINE':'OFFLINE';
+}).catch(()=>{})}
+setInterval(poll,1000);poll();
+var stepTimer=null;
+function startStep(btn){
+    var idx=btn.dataset.idx, dir=parseInt(btn.dataset.dir);
+    var deg=parseInt(document.getElementById('stepSize').value)||5;
+    cmd('SV:'+idx+':'+(dir*deg));
+    stopStep();
+    stepTimer=setInterval(function(){
+        var d=parseInt(document.getElementById('stepSize').value)||5;
+        cmd('SV:'+idx+':'+(dir*d));
+    },150);
+}
+function stopStep(){if(stepTimer){clearInterval(stepTimer);stepTimer=null;}}
+document.querySelectorAll('.step-btn').forEach(function(btn){
+    btn.addEventListener('pointerdown',function(e){e.preventDefault();startStep(btn);});
+    btn.addEventListener('pointerup',stopStep);
+    btn.addEventListener('pointerleave',stopStep);
+    btn.addEventListener('pointercancel',stopStep);
+});
+</script></body></html>
+)rawliteral";
+
+static void handleRoot() {
+  localServer.send_P(200, "text/html", ARM_PAGE);
+}
+
+static void handleCmd() {
+  String c = localServer.arg("c");
+  if (c.length() > 0 && c.length() < 10) {
+    if (enqueueCmd(c.c_str()))
+      localServer.send(200, "text/plain", "OK:" + c);
+    else
+      localServer.send(503, "text/plain", "QUEUE FULL");
+  } else {
+    localServer.send(400, "text/plain", "BAD CMD");
+  }
+}
+
+static void handleStatus() {
+  String json = "{";
+  json += "\"ws\":" + String(wsClient.isConnected() ? "true" : "false");
+  json += ",\"base\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
+  json += ",\"free\":" + String(ESP.getFreeHeap());
+  json += "}";
+  localServer.send(200, "application/json", json);
+}
+
+static void initLocalServer() {
+  localServer.on("/", handleRoot);
+  localServer.on("/cmd", HTTP_GET, handleCmd);
+  localServer.on("/status", HTTP_GET, handleStatus);
+  localServer.begin();
+  Serial.println("[ARM] Local HTTP server started on AP");
+}
+// ================= LOCAL HTTP SERVER =================
 
 // ================= PCA9685 =================
 Adafruit_PWMServoDriver driver = Adafruit_PWMServoDriver();
@@ -542,9 +699,10 @@ static void sendArmStatus(bool busy) {
   ArmStatus st = {};
   st.type = 0;
   st.busy = busy ? 1 : 0;
-  esp_err_t err = esp_now_send(baseAddress, (uint8_t *)&st, sizeof(st));
-  if (err != ESP_OK) {
-    Serial.printf("[ARM] ESP-NOW send FAILED: %d (busy=%d)\n", err, busy);
+  if (wsClient.isConnected()) {
+    wsClient.sendBIN((uint8_t *)&st, sizeof(st));
+  } else {
+    Serial.println("[ARM] WS not connected — status dropped");
   }
 }
 
@@ -581,74 +739,19 @@ static void dispatchCmd(const char *cmd) {
     Serial.printf("[ARM] Unknown: %s\n", cmd);
 }
 
-// ================= ESP-NOW RECEIVE CALLBACK =================
-// Runs in the WiFi task — MUST return immediately.
-void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData,
-                int len) {
-  if (!incomingData || len < 1)
-    return;
-  // Camera pose packet (24 bytes, type=1)
-  if (len == (int)sizeof(CameraPoseData)) {
-    CameraPoseData pose;
-    memcpy(&pose, incomingData, sizeof(pose));
-    if (pose.type == 1 && pose.pose_valid) {
-      memcpy((void *)&incomingCameraPose, &pose, sizeof(pose));
-      cameraPoseReady = true;
-      Serial.printf("[ARM] Camera pose received: color=%d conf=%.2f "
-                    "qr=(%.0f,%.0f,%.0f)\n",
-                    pose.color, pose.confidence, pose.tx_mm, pose.ty_mm,
-                    pose.tz_mm);
-    }
-    return;
-  }
-
-  // Arm command (10 bytes)
-  if (len != (int)sizeof(ArmCommand))
-    return;
-
-  ArmCommand msg;
-  memcpy(&msg, incomingData, sizeof(msg));
-  msg.command[9] = '\0';
-
-  if (!enqueueCmd(msg.command))
-    Serial.println("[ARM] Queue full — drop");
-  else
-    Serial.printf("[ARM] Q+: %s\n", msg.command);
-}
-
 // ================= WIFI RECONNECT (throttled) =================
 // Only attempts once every 5 s.  Does NOT block.
 static unsigned long lastWifiAttempt = 0;
-static bool wasWifiConnected = false;
 
 static void checkWifi() {
   bool isConnected = (WiFi.status() == WL_CONNECTED);
-
-  // Detect reconnection: was not connected, now is connected
-  if (!wasWifiConnected && isConnected) {
-    Serial.println("[ARM] WiFi reconnected, updating ESP-NOW peer channel");
-    // Remove old peer, re-add with correct channel
-    esp_now_del_peer(baseAddress);
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, baseAddress, 6);
-    peerInfo.channel = 11; // Must match Base AP WIFI_CHANNEL
-    peerInfo.encrypt = false;
-    peerInfo.ifidx = WIFI_IF_STA;
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      Serial.println("[ESP-NOW] Failed to re-add base peer after reconnect");
-    } else {
-      Serial.println("[ESP-NOW] Base peer re-added with correct channel");
-    }
-  }
-  wasWifiConnected = isConnected;
 
   if (isConnected)
     return;
   if (millis() - lastWifiAttempt < 5000)
     return;
   lastWifiAttempt = millis();
-  Serial.println("[ARM] WiFi down, reconnecting...");
-  WiFi.disconnect();
+  Serial.println("[ARM] STA down, reconnecting to base...");
   WiFi.begin("GLITCH", "Gl1tch2024!Secure");
 }
 
@@ -670,71 +773,57 @@ void setup() {
   delay(1000);
   Serial.println("[ARM] PCA9685 init done");
 
-  // WiFi STA mode — after I2C/PCA9685 (matches Blynk init order)
-  WiFi.mode(WIFI_STA);
-  WiFi.begin("GLITCH", "Gl1tch2024!Secure");
+  // WiFi AP+STA mode — own AP always on, STA tries to connect to base
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(IPAddress(192, 168, 5, 1), IPAddress(192, 168, 5, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP("GLITCH-ARM", "Gl1tch2024!Secure", 11);
+  Serial.printf("[ARM] AP: %s ch=11\n", WiFi.softAPIP().toString().c_str());
 
-  // Wait for WiFi connection (up to 5s) so ESP-NOW can send to base
+  // STA: try to connect to base AP (non-blocking after timeout)
+  WiFi.begin("GLITCH", "Gl1tch2024!Secure");
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 5000) {
     delay(100);
   }
   esp_wifi_set_ps(WIFI_PS_NONE);
 
-  Serial.printf("[ARM] MAC: %s  WiFi: %s  ch=%d\n", WiFi.macAddress().c_str(),
+  Serial.printf("[ARM] MAC: %s  STA: %s  AP: %s\n",
+                WiFi.macAddress().c_str(),
                 (WiFi.status() == WL_CONNECTED) ? "OK" : "DOWN",
-                WiFi.channel());
+                WiFi.softAPIP().toString().c_str());
 
-  // ESP-NOW init (must come after WiFi.mode)
-  if (esp_now_init() == ESP_OK) {
-    esp_now_register_recv_cb(OnDataRecv);
+  // WebSocket client — connects to base AP if available
+  wsClient.begin(BASE_WS_HOST, BASE_WS_PORT, "/");
+  wsClient.onEvent(onWsEvent);
 
-    // Track ESP-NOW send delivery
-    esp_now_register_send_cb(
-        [](const uint8_t *mac_addr, esp_now_send_status_t status) {
-          if (status == ESP_NOW_SEND_SUCCESS)
-            espnowTxOk++;
-          else
-            espnowTxFail++;
-        });
+  // Local HTTP server — always available via AP
+  initLocalServer();
 
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, baseAddress, 6);
-    peerInfo.channel = 11;
-    peerInfo.encrypt = false;
-    peerInfo.ifidx = WIFI_IF_STA;
-
-    if (esp_now_add_peer(&peerInfo) != ESP_OK)
-      Serial.println("[ESP-NOW] Failed to add base peer");
-    else
-      Serial.println("[ESP-NOW] Base peer added — ready");
-  } else {
-    Serial.println("[ESP-NOW] Init failed");
-  }
-
-  Serial.println("[ARM] Ready");
-  // Initialize reconnect tracker so first loop() doesn't delete/re-add the peer
-  wasWifiConnected = (WiFi.status() == WL_CONNECTED);
-  // goHome() moved to loop() — blocking in setup() disrupts WiFi/ESP-NOW init
+  Serial.println("[ARM] Ready — AP+STA, WebSocket + local HTTP");
 }
 
 // ================= LOOP =================
 void loop() {
-  // Run goHome once on first iteration (was blocking setup for seconds)
   static bool homed = false;
   if (!homed) {
     homed = true;
-    goHome(); // Move to home position (matches Blynk config)
+    goHome();
   }
 
+  if (WiFi.status() == WL_CONNECTED) {
+    wsClient.loop();  // Only poll WebSocket when STA is up
+  }
+  localServer.handleClient();  // Always process local HTTP requests
   checkWifi();
 
   static unsigned long lastStatus = 0;
   if (millis() - lastStatus > 5000) {
     lastStatus = millis();
-    Serial.printf("[ARM] WiFi ch=%d status=%d free=%d tx_ok=%lu tx_fail=%lu\n",
-                  WiFi.channel(), WiFi.status(), ESP.getFreeHeap(),
-                  (unsigned long)espnowTxOk, (unsigned long)espnowTxFail);
+    Serial.printf("[ARM] STA=%d WS=%d AP=%s free=%d\n",
+                  WiFi.status() == WL_CONNECTED ? 1 : 0,
+                  wsClient.isConnected() ? 1 : 0,
+                  WiFi.softAPIP().toString().c_str(),
+                  ESP.getFreeHeap());
     // Heartbeat: send idle status so base knows arm is alive
     if (WiFi.status() == WL_CONNECTED) {
       sendArmStatus(false);
