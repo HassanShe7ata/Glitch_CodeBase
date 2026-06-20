@@ -11,7 +11,6 @@
 #include <esp_wifi.h>
 #include <math.h>
 
-
 // ================= WIFI AP =================
 const char *AP_SSID = "GLITCH";
 const char *AP_PASS = "Gl1tch2024!Secure";
@@ -26,7 +25,9 @@ static WebSocketsServer wsServer(WS_PORT);
 
 static void wsArmSendCommand(const char *cmd) {
   // Send command to arm via WebSocket (binary, same struct as ESP-NOW)
-  struct { char command[10]; } armMsg;
+  struct {
+    char command[10];
+  } armMsg;
   strncpy(armMsg.command, cmd, 9);
   armMsg.command[9] = '\0';
   wsServer.sendBIN(0, (uint8_t *)&armMsg, sizeof(armMsg));
@@ -173,9 +174,10 @@ bool moveIsRotation = false;
 
 // --- HEADING PID (gyro correction during linear movement) ---
 const float KP_HEADING = 0.5f;
-const float KI_HEADING = 0.04f;
-const float KD_HEADING = 5.0f;
-const float I_MAX_HEADING = 40.0f;
+const float KI_HEADING = 0.12f;
+const float KD_HEADING = 1.0f;
+const float I_MAX_HEADING = 15.0f;
+const float HEADING_DEADBAND = 2.0f;
 static float headingIntegral = 0.0f;
 static float headingPrevError = 0.0f;
 
@@ -231,18 +233,18 @@ void trackMovement(const int8_t vector[], float dist_mm);
 
 // --- CALIBRATED TICK CONSTANTS (Blynk values × 97/80, distance in meters) ---
 const float TICKS_FWD_BWD = 7463.611f; // updated by 100/90 factor
-const float TICKS_STRAFE = 7581.71f;
+const float TICKS_STRAFE = 7897.61f;
 const float TICKS_DIAG = 9548.44f;
 const float TICKS_ROTATE = 8730.00f;
 
 // --- COMPETITION DISTANCES (meters) - update after calibration ---
-const float DIST_1 = 1.0;  // FWD to red box
-const float DIST_2 = 1.0;  // FWD to platform
-const float DIST_3 = 0.5;  // BWD centering
-const float DIST_4 = 1.0;  // RIGHT to green box
-const float DIST_5 = 1.0;  // LEFT centering
-const float DIST_6 = 1.0;  // FWD after 180 turn
-const float DIST_7 = 1.0;  // DIAG to blue box
+const float DIST_1 = 0.6;   // FWD to red box
+const float DIST_2 = 1.33;  // FWD to platform
+const float DIST_3 = 0.5;   // BWD centering
+const float DIST_4 = 1.55;  // RIGHT to green box
+const float DIST_5 = 1.0;   // LEFT centering
+const float DIST_6 = 1.415; // FWD after 180 turn
+const float DIST_7 = 0.5;   // DIAG to blue box
 
 int8_t Motor_speed = 25;
 
@@ -296,8 +298,7 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 
   espNowRecvCount++;
   espNowRecvBytes += len;
-  if (len == (int)sizeof(PoseReply) &&
-      data[0] == ESPNOW_TYPE_POSE_REPLY) {
+  if (len == (int)sizeof(PoseReply) && data[0] == ESPNOW_TYPE_POSE_REPLY) {
     portENTER_CRITICAL(&camMux);
     memcpy((void *)&lastPoseReply, data, sizeof(PoseReply));
     portEXIT_CRITICAL(&camMux);
@@ -364,8 +365,10 @@ static void i2cBusRecover() {
   Wire.end();
   pinMode(SCL_PIN, OUTPUT);
   for (int i = 0; i < 16; i++) {
-    digitalWrite(SCL_PIN, HIGH); delayMicroseconds(5);
-    digitalWrite(SCL_PIN, LOW);  delayMicroseconds(5);
+    digitalWrite(SCL_PIN, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(SCL_PIN, LOW);
+    delayMicroseconds(5);
   }
   pinMode(SCL_PIN, INPUT);
   Wire.begin(SDA_PIN, SCL_PIN, 100000);
@@ -385,7 +388,8 @@ bool writeBytes(uint8_t reg, uint8_t *data, size_t len) {
   }
   i2cWriteFails++;
   if (i2cWriteFails % 20 == 1)
-    Serial.printf("[I2C] writeBytes failed %lu times\n", (unsigned long)i2cWriteFails);
+    Serial.printf("[I2C] writeBytes failed %lu times\n",
+                  (unsigned long)i2cWriteFails);
   i2cBusRecover();
   return false;
 }
@@ -414,7 +418,8 @@ bool readEncoders(int32_t *data) {
   }
   i2cReadFails++;
   if (i2cReadFails % 20 == 1)
-    Serial.printf("[I2C] readEncoders failed %lu times\n", (unsigned long)i2cReadFails);
+    Serial.printf("[I2C] readEncoders failed %lu times\n",
+                  (unsigned long)i2cReadFails);
   i2cBusRecover();
   return false;
 }
@@ -427,8 +432,9 @@ static uint32_t lastSpeedWriteMs = 0;
 
 bool writeSpeeds(int8_t v1, int8_t v2, int8_t v3, int8_t v4) {
   uint32_t now = millis();
-  bool speedsChanged = (v1 != lastWrittenSpeeds[0] || v2 != lastWrittenSpeeds[1] ||
-                        v3 != lastWrittenSpeeds[2] || v4 != lastWrittenSpeeds[3]);
+  bool speedsChanged =
+      (v1 != lastWrittenSpeeds[0] || v2 != lastWrittenSpeeds[1] ||
+       v3 != lastWrittenSpeeds[2] || v4 != lastWrittenSpeeds[3]);
   bool refreshDue = (now - lastSpeedWriteMs >= SPEED_REFRESH_MS);
 
   if (!speedsChanged && !refreshDue)
@@ -464,11 +470,14 @@ void updateMotors() {
       yawError -= 360;
     if (yawError < -180)
       yawError += 360;
-    if (fabs(yawError) > 2.0f) {
-      headingIntegral += yawError;
-      headingIntegral = constrain(headingIntegral, -I_MAX_HEADING, I_MAX_HEADING);
+    if (fabs(yawError) > HEADING_DEADBAND) {
+      if (fabs(yawError) < 10.0f)
+        headingIntegral += yawError;
+      headingIntegral =
+          constrain(headingIntegral, -I_MAX_HEADING, I_MAX_HEADING);
       float dError = yawError - headingPrevError;
-      float gyroCorr = KP_HEADING * yawError + KI_HEADING * headingIntegral + KD_HEADING * dError;
+      float gyroCorr = KP_HEADING * yawError + KI_HEADING * headingIntegral +
+                       KD_HEADING * dError;
       int8_t corr = (int8_t)constrain(gyroCorr, -127.0f, 127.0f);
       fl += corr;
       fr -= corr;
@@ -484,9 +493,11 @@ void updateMotors() {
   int8_t obr = constrain(br, -100, 100);
 
   if (millis() - lastMotorDbgMs > 500) {
-    Serial.printf("[MOT] spd=%d vec=[%d,%d,%d,%d] yaw=%.1f tgt=%.1f fl=%d fr=%d bl=%d br=%d\n",
-                  (int)moveSpeed, (int)moveVec[0], (int)moveVec[1], (int)moveVec[2], (int)moveVec[3],
-                  currentYaw, moveTargetHeading, (int)ofl, (int)ofr, (int)obl, (int)obr);
+    Serial.printf("[MOT] spd=%d vec=[%d,%d,%d,%d] yaw=%.1f tgt=%.1f fl=%d "
+                  "fr=%d bl=%d br=%d\n",
+                  (int)moveSpeed, (int)moveVec[0], (int)moveVec[1],
+                  (int)moveVec[2], (int)moveVec[3], currentYaw,
+                  moveTargetHeading, (int)ofl, (int)ofr, (int)obl, (int)obr);
     lastMotorDbgMs = millis();
   }
 
@@ -588,10 +599,12 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
       yawError -= 360;
     if (yawError < -180)
       yawError += 360;
-    headingIntegral += yawError;
+    if (fabs(yawError) < 10.0f)
+      headingIntegral += yawError;
     headingIntegral = constrain(headingIntegral, -I_MAX_HEADING, I_MAX_HEADING);
     float dError = yawError - headingPrevError;
-    float gyroCorr = KP_HEADING * yawError + KI_HEADING * headingIntegral + KD_HEADING * dError;
+    float gyroCorr = KP_HEADING * yawError + KI_HEADING * headingIntegral +
+                     KD_HEADING * dError;
     int8_t corr = (int8_t)constrain(gyroCorr, -127.0f, 127.0f);
     headingPrevError = yawError;
 
@@ -614,11 +627,12 @@ void rotateDegrees(bool clockwise, float degrees, int8_t maxSpeed) {
   robotState = clockwise ? "Rotating CW" : "Rotating CCW";
 
   const float KP_ROTATE = 0.5f;
-  const float KI_ROTATE = 0.04f;
-  const float KD_ROTATE = 5.0f;
+  const float KI_ROTATE = 0.12f;
+  const float KD_ROTATE = 1.0f;
   const float MIN_SPEED = 12.0f;
   const float STOP_THRESHOLD = 1.0f;
-  const float I_MAX = 40.0f;
+  const float I_MAX = 15.0f;
+  const float ROT_D_FILTER_ALPHA = 0.3f;
 
   updateYaw();
   float startHeading = currentYaw;
@@ -627,6 +641,7 @@ void rotateDegrees(bool clockwise, float degrees, int8_t maxSpeed) {
 
   float prevError = degrees;
   float integral = 0.0f;
+  float rotFilteredDError = 0.0f;
 
   while (true) {
     server.handleClient();
@@ -642,12 +657,15 @@ void rotateDegrees(bool clockwise, float degrees, int8_t maxSpeed) {
     if (fabs(yawError) < STOP_THRESHOLD)
       break;
 
-    integral += yawError;
+    if (fabs(yawError) < 10.0f)
+      integral += yawError;
     integral = constrain(integral, -I_MAX, I_MAX);
 
     float dError = yawError - prevError;
-    float turnSpeed =
-        KP_ROTATE * yawError + KI_ROTATE * integral + KD_ROTATE * dError;
+    rotFilteredDError = ROT_D_FILTER_ALPHA * dError +
+                        (1.0f - ROT_D_FILTER_ALPHA) * rotFilteredDError;
+    float turnSpeed = KP_ROTATE * yawError + KI_ROTATE * integral +
+                      KD_ROTATE * rotFilteredDError;
 
     if (fabs(turnSpeed) < MIN_SPEED && fabs(yawError) > STOP_THRESHOLD * 3) {
       turnSpeed = (turnSpeed > 0) ? MIN_SPEED : -MIN_SPEED;
@@ -670,11 +688,16 @@ void rotateToHeading(float targetHeading, int8_t maxSpeed) {
   updateYaw();
   float startHeading = currentYaw;
   float diff = targetHeading - startHeading;
-  while (diff > 180) diff -= 360;
-  while (diff < -180) diff += 360;
+  while (diff > 180)
+    diff -= 360;
+  while (diff < -180)
+    diff += 360;
   bool clockwise = (diff > 0);
   float degrees = fabs(diff);
-  if (degrees < 1.0f) { forceStop(); return; }
+  if (degrees < 1.0f) {
+    forceStop();
+    return;
+  }
   rotateDegrees(clockwise, degrees, maxSpeed);
 }
 
@@ -1984,7 +2007,17 @@ void loop() {
   if (pendingStep && !moveActive) {
     if (stepArg.startsWith("POSE:")) {
       float heading = stepArg.substring(5).toFloat();
-      rotateToHeading(heading, Motor_speed);
+      for (int attempt = 0; attempt < 3; attempt++) {
+        rotateToHeading(heading, Motor_speed);
+        updateYaw();
+        float err = heading - currentYaw;
+        if (err > 180)
+          err -= 360;
+        if (err < -180)
+          err += 360;
+        if (fabs(err) < 1.0f)
+          break;
+      }
     }
     pendingStep = false;
   }
@@ -1993,10 +2026,10 @@ void loop() {
   static unsigned long lastStatusUpdate = 0;
   if (millis() - lastStatusUpdate > 5000) {
     lastStatusUpdate = millis();
-    Serial.printf(
-        "[ESP-NOW RX] total=%lu bytes=%lu pose=%lu\n",
-        (unsigned long)espNowRecvCount, (unsigned long)espNowRecvBytes,
-        (unsigned long)espNowRecvMatchPose);
+    Serial.printf("[ESP-NOW RX] total=%lu bytes=%lu pose=%lu\n",
+                  (unsigned long)espNowRecvCount,
+                  (unsigned long)espNowRecvBytes,
+                  (unsigned long)espNowRecvMatchPose);
   }
 
   // =================== AUTONOMOUS SEQUENCES ===================
@@ -2014,13 +2047,24 @@ void loop() {
     if (!autonomousMode)
       goto calEnd;
 
-    Serial.println("[AUTO] Step 2: Rotate 90 CW");
-    rotateDegrees(true, 90, Motor_speed);
+    delay(2500);
+
+    Serial.println("[AUTO] Strafe right for 1 meter (calibration)");
+    moveDistanceKp(V_STRAFE_R, Motor_speed, 1.0, TICKS_STRAFE);
     if (!autonomousMode)
       goto calEnd;
 
-    Serial.println("[AUTO] Step 3: Rotate 90 CCW (back to 0)");
-    rotateDegrees(false, 90, Motor_speed);
+    delay(2500);
+
+    // rotate 180 degrees
+    rotateDegrees(false, 180.0, Motor_speed);
+    if (!autonomousMode)
+      goto calEnd;
+
+    delay(2500);
+
+    Serial.println("[AUTO] Diagonal FWD 1m (record encoder data)");
+    moveDistanceKp(V_DIAG_FR, Motor_speed, 1.0, TICKS_DIAG);
     if (!autonomousMode)
       goto calEnd;
 
@@ -2054,8 +2098,14 @@ void loop() {
     if (!autonomousMode)
       goto autoEnd;
 
-    // Step 4: FWD to platform
-    Serial.println("[AUTO] Step 4: Forward to platform");
+    /*sep 3.5: Pose correction to 0 again
+    Serial.println("[AUTO] Step 4: Rotate 0 degrees");
+    rotateToHeading(0, Motor_speed);
+    if (!autonomousMode)
+      goto autoEnd;*/
+
+    // Step 4 FWD to platform
+    Serial.println("[AUTO] Step 5: Forward to platform");
     moveDistanceKp(V_FORWARD, Motor_speed, DIST_2, TICKS_FWD_BWD);
     if (!autonomousMode)
       goto autoEnd;
@@ -2075,6 +2125,12 @@ void loop() {
 
     // Step 7: Pose correction to 0
     Serial.println("[AUTO] Step 7: Pose correction to 0");
+    rotateToHeading(0, Motor_speed);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    // Step 7.5: Pose correction to 0 again
+    Serial.println("[AUTO] Step 7.5: Rotate 0 degrees");
     rotateToHeading(0, Motor_speed);
     if (!autonomousMode)
       goto autoEnd;
@@ -2106,6 +2162,12 @@ void loop() {
 
     // Step 12: Pose correction to 180
     Serial.println("[AUTO] Step 12: Pose correction to 180");
+    rotateToHeading(180, Motor_speed);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    // Step 12.5: Pose correction to 180 again
+    Serial.println("[AUTO] Step 12.5: Rotate 180 degrees");
     rotateToHeading(180, Motor_speed);
     if (!autonomousMode)
       goto autoEnd;

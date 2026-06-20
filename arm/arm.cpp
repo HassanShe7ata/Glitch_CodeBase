@@ -260,11 +260,11 @@ const long MIN_MOVE_DURATION = 300;
 // ================= WAYPOINTS =================
 float posGreen[4] = {0, 100, 55, -100};
 float posBlue[4] = {-100, 50, 55, -100}; // first number was -90
-float posRed[4] = {100, 50, 55, -100};   // first number was 90
-float posRod[4] = {0, 260, 241, 0};
+float posRed[4] = {120, 40, 55, -100};   // first number was 90
+float posRod[4] = {0, 260, 250, 0};
 float dropGreen[4] = {235, 0, 0, -90};  // right of car
 float dropBlue[4] = {166, 166, 0, -90}; // diagonal right 45°
-float dropRed[4] = {0, 235, 0, -90};    // front of car
+float dropRed[4] = {0, 200, -100, -90}; // front of car
 
 // ================= GLOBAL STATE =================
 float currentAngle[NUM_SERVOS] = {90, 170, 180, 100, GRIP_OPEN};
@@ -564,11 +564,11 @@ void stepServo(int idx, int dir) {
 // delay(200) after gripper close gives the physical gripper time to seat.
 
 void GreenToFloor() {
-  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 0);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 0);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 50, posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 10, posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 10, posGreen[3], 1);
   delay(200);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 50, posGreen[3], 1);
   moveRobot(dropGreen[0], dropGreen[1], dropGreen[2], dropGreen[3], 1);
   moveRobot(dropGreen[0], dropGreen[1], dropGreen[2], dropGreen[3], 0);
   delay(200);
@@ -576,11 +576,11 @@ void GreenToFloor() {
 }
 
 void BlueToFloor() {
-  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 0);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2], posBlue[3], 0);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2], posBlue[3], 1);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 50, posBlue[3], 0);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 10, posBlue[3], 0);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 10, posBlue[3], 1);
   delay(200);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 1);
+  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 50, posBlue[3], 1);
   moveRobot(dropBlue[0], dropBlue[1], dropBlue[2], dropBlue[3], 1);
   moveRobot(dropBlue[0], dropBlue[1], dropBlue[2], dropBlue[3], 0);
   delay(200);
@@ -588,11 +588,12 @@ void BlueToFloor() {
 }
 
 void RedToFloor() {
-  moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 0);
-  moveRobot(posRed[0], posRed[1], posRed[2], posRed[3], 0);
-  moveRobot(posRed[0], posRed[1], posRed[2], posRed[3], 1);
+  moveRobot(posRed[0], posRed[1], posRed[2] + 50, posRed[3], 0);
+  moveRobot(posRed[0], posRed[1], posRed[2] + 10, posRed[3], 0);
+  moveRobot(posRed[0], posRed[1], posRed[2] + 10, posRed[3], 1);
   delay(200);
-  moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 1);
+  moveRobot(posRed[0], posRed[1], posRed[2] + 50, posRed[3], 1);
+  moveRobot(dropRed[0], dropRed[1] + 20, dropRed[2] + 140, dropRed[3], 1);
   moveRobot(dropRed[0], dropRed[1], dropRed[2], dropRed[3], 1);
   moveRobot(dropRed[0], dropRed[1], dropRed[2], dropRed[3], 0);
   delay(200);
@@ -604,7 +605,7 @@ void GreenToCar() {
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
   moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
   moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 1);
-  moveRobot(posGreen[0], posGreen[1] + 20, posGreen[2], posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2], posGreen[3], 1);
   moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 0);
   moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 0);
   delay(200);
@@ -616,7 +617,7 @@ void BlueToCar() {
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
   moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
   moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 1);
-  moveRobot(posBlue[0] - 45, posBlue[1] + 15, posBlue[2], posBlue[3], 1);
+  moveRobot(posBlue[0] - 45, posBlue[1], posBlue[2], posBlue[3], 1);
   moveRobot(posBlue[0], posBlue[1], posBlue[2], posBlue[3], 0);
   moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 0);
   delay(200);
