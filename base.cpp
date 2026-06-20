@@ -593,27 +593,50 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
 
 void rotateDegrees(bool clockwise, float degrees, int8_t maxSpeed) {
   robotState = clockwise ? "Rotating CW" : "Rotating CCW";
+
+  const float KP_ROTATE = 0.5f;
+  const float KI_ROTATE = 0.04f;
+  const float KD_ROTATE = 5.0f;
+  const float MIN_SPEED = 12.0f;
+  const float STOP_THRESHOLD = 1.0f;
+  const float I_MAX = 40.0f;
+
   updateYaw();
   float startHeading = currentYaw;
   float target =
       clockwise ? (startHeading + degrees) : (startHeading - degrees);
 
+  float prevError = degrees;
+  float integral = 0.0f;
+
   while (true) {
     server.handleClient();
     wsServer.loop();
     updateYaw();
+
     float yawError = target - currentYaw;
     if (yawError > 180)
       yawError -= 360;
     if (yawError < -180)
       yawError += 360;
 
-    if (fabs(yawError) < 1.0f)
+    if (fabs(yawError) < STOP_THRESHOLD)
       break;
 
-    int8_t turnSpeed = (fabs(yawError) < 20.0f) ? 20 : maxSpeed;
-    if (yawError < 0)
-      turnSpeed = -turnSpeed;
+    integral += yawError;
+    integral = constrain(integral, -I_MAX, I_MAX);
+
+    float dError = yawError - prevError;
+    float turnSpeed =
+        KP_ROTATE * yawError + KI_ROTATE * integral + KD_ROTATE * dError;
+
+    if (fabs(turnSpeed) < MIN_SPEED && fabs(yawError) > STOP_THRESHOLD * 3) {
+      turnSpeed = (turnSpeed > 0) ? MIN_SPEED : -MIN_SPEED;
+    }
+
+    turnSpeed = constrain(turnSpeed, -(float)maxSpeed, (float)maxSpeed);
+
+    prevError = yawError;
 
     writeSpeeds(turnSpeed * V_ROTATE_CW[0], turnSpeed * V_ROTATE_CW[1],
                 turnSpeed * V_ROTATE_CW[2], turnSpeed * V_ROTATE_CW[3]);
@@ -1428,7 +1451,7 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-seri
 .cam-wrap img{max-width:100%;max-height:100%;object-fit:contain}
 .cam-label{position:absolute;top:8px;left:8px;background:rgba(0,0,0,0.7);color:#0f0;font-size:10px;padding:2px 8px;border-radius:4px;font-family:monospace}
 .right-stack{display:flex;flex-direction:column;gap:8px}
-.map-wrap{flex:1;position:relative;min-height:0}
+.map-wrap{flex:1;position:relative;min-height:180px}
 .map-wrap canvas{width:100%;height:100%;border-radius:6px}
 .info-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .info-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
@@ -1880,15 +1903,17 @@ void loop() {
   server.handleClient();
   wsServer.loop();
 
-  // =================== I2C: MOTOR-ONLY DURING MANUAL DRIVE ===================
+  // =================== I2C SEQUENCING ===================
+  // updateYaw() reads MPU6050 (0x68), updateMotors()/updateDeadReckoning()
+  // read/write motor driver (0x34). Sequence: yaw first, then motor/encoder,
+  // so the I2C bus is free for the next yaw read.
   if (!autonomousMode) {
     updateYaw();
     if (moveActive) {
       delayMicroseconds(200);
       updateMotors();
-    } else {
-      updateDeadReckoning();
     }
+    updateDeadReckoning();
   } else {
     updateYaw();
     updateDeadReckoning();
