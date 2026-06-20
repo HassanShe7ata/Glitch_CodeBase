@@ -238,15 +238,15 @@ const float TICKS_DIAG = 9548.44f;
 const float TICKS_ROTATE = 8730.00f;
 
 // --- COMPETITION DISTANCES (meters) - update after calibration ---
-const float DIST_1 = 0.6;   // FWD to red box
+const float DIST_1 = 0.615; // FWD to red box
 const float DIST_2 = 1.33;  // FWD to platform
-const float DIST_3 = 0.5;   // BWD centering
-const float DIST_4 = 1.55;  // RIGHT to green box
-const float DIST_5 = 1.0;   // LEFT centering
-const float DIST_6 = 1.415; // FWD after 180 turn
-const float DIST_7 = 0.5;   // DIAG to blue box
+const float DIST_3 = 0.35;  // BWD centering //was 0.5
+const float DIST_4 = 1.65;  // RIGHT to green box
+const float DIST_5 = 0.1;   // LEFT centering
+const float DIST_6 = 1.45;  // FWD after 180 turn
+const float DIST_7 = 0.9;   // DIAG to blue box
 
-int8_t Motor_speed = 25;
+int8_t Motor_speed = 100;
 
 // --- STABILITY CONTROL ---
 const float KP_POS = 0.005;
@@ -799,8 +799,23 @@ static bool alignToQR() {
 // Blocks until arm finishes current command (busy -> idle transition).
 // Returns true if arm went idle, false on timeout or autonomousMode=false.
 static bool waitForArmIdle(unsigned long timeout_ms) {
-  delay(300); // Give arm time to receive command and go busy
   unsigned long t0 = millis();
+
+  // Phase 1: Wait for arm to go busy (confirms command was received)
+  while (millis() - t0 < timeout_ms / 2) {
+    if (!autonomousMode)
+      return false;
+    ArmStatus st;
+    memcpy(&st, (const void *)&lastArmStatus, sizeof(st));
+    if (st.busy)
+      break;
+    server.handleClient();
+    updateYaw();
+    updateDeadReckoning();
+    delay(50);
+  }
+
+  // Phase 2: Wait for arm to become idle
   while (millis() - t0 < timeout_ms) {
     if (!autonomousMode)
       return false;
@@ -811,8 +826,9 @@ static bool waitForArmIdle(unsigned long timeout_ms) {
     server.handleClient();
     updateYaw();
     updateDeadReckoning();
-    delay(100);
+    delay(50);
   }
+
   Serial.println("[AUTO] Arm idle timeout");
   return false;
 }
@@ -2092,11 +2108,11 @@ void loop() {
     if (!autonomousMode)
       goto autoEnd;
 
-    // Step 3: Pose correction to 0
+    /* Step 3: Pose correction to 0
     Serial.println("[AUTO] Step 3: Pose correction to 0");
     rotateToHeading(0, Motor_speed);
     if (!autonomousMode)
-      goto autoEnd;
+      goto autoEnd;*/
 
     /*sep 3.5: Pose correction to 0 again
     Serial.println("[AUTO] Step 4: Rotate 0 degrees");
@@ -2104,16 +2120,16 @@ void loop() {
     if (!autonomousMode)
       goto autoEnd;*/
 
-    // Step 4 FWD to platform
-    Serial.println("[AUTO] Step 5: Forward to platform");
+    // Step 4 FWD to red box area
+    Serial.println("[AUTO] Step 5: Forward to red box area");
     moveDistanceKp(V_FORWARD, Motor_speed, DIST_2, TICKS_FWD_BWD);
     if (!autonomousMode)
       goto autoEnd;
 
-    // Step 5: Red to Platform
-    Serial.println("[AUTO] Step 5: Red -> Platform");
-    sendCommandToArm("RTP");
-    waitForArmIdle(20000);
+    // Step 5: Red to Floor
+    Serial.println("[AUTO] Step 5: Red -> Floor");
+    sendCommandToArm("RTF");
+    waitForArmIdle(15000);
     if (!autonomousMode)
       goto autoEnd;
 
@@ -2141,10 +2157,10 @@ void loop() {
     if (!autonomousMode)
       goto autoEnd;
 
-    // Step 9: Green to Platform
-    Serial.println("[AUTO] Step 9: Green -> Platform");
-    sendCommandToArm("GTP");
-    waitForArmIdle(20000);
+    // Step 9: Green to Floor
+    Serial.println("[AUTO] Step 9: Green -> Floor");
+    sendCommandToArm("GTF");
+    waitForArmIdle(15000);
     if (!autonomousMode)
       goto autoEnd;
 
@@ -2159,13 +2175,13 @@ void loop() {
     rotateDegrees(true, 180, Motor_speed);
     if (!autonomousMode)
       goto autoEnd;
-
-    // Step 12: Pose correction to 180
-    Serial.println("[AUTO] Step 12: Pose correction to 180");
-    rotateToHeading(180, Motor_speed);
-    if (!autonomousMode)
-      goto autoEnd;
-
+    /*
+        // Step 12: Pose correction to 180
+        Serial.println("[AUTO] Step 12: Pose correction to 180");
+        rotateToHeading(180, Motor_speed);
+        if (!autonomousMode)
+          goto autoEnd;
+    */
     // Step 12.5: Pose correction to 180 again
     Serial.println("[AUTO] Step 12.5: Rotate 180 degrees");
     rotateToHeading(180, Motor_speed);
@@ -2184,9 +2200,9 @@ void loop() {
     if (!autonomousMode)
       goto autoEnd;
 
-    // Step 15: Blue to Platform
-    Serial.println("[AUTO] Step 15: Blue -> Platform");
-    sendCommandToArm("BTP");
+    // Step 15: Blue to Floor
+    Serial.println("[AUTO] Step 15: Blue -> Floor");
+    sendCommandToArm("BTF");
     waitForArmIdle(20000);
 
     Serial.println("[AUTO] === Competition sequence complete ===");

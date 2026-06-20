@@ -263,7 +263,7 @@ float posBlue[4] = {-100, 50, 55, -100}; // first number was -90
 float posRed[4] = {120, 40, 55, -100};   // first number was 90
 float posRod[4] = {0, 260, 250, 0};
 float dropGreen[4] = {235, 0, 0, -90};  // right of car
-float dropBlue[4] = {166, 166, 0, -90}; // diagonal right 45°
+float dropBlue[4] = {80, 200, 0, -90};  // diagonal right 45°
 float dropRed[4] = {0, 200, -100, -90}; // front of car
 
 // ================= GLOBAL STATE =================
@@ -564,11 +564,13 @@ void stepServo(int idx, int dir) {
 // delay(200) after gripper close gives the physical gripper time to seat.
 
 void GreenToFloor() {
-  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 50, posGreen[3], 0);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 10, posGreen[3], 0);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 10, posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2] + 50, posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2] + 5, posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2] + 5, posGreen[3], 1);
   delay(200);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 50, posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2] + 70, posGreen[3], 1);
+  moveRobot(dropGreen[0] - 20, dropGreen[1], dropGreen[2] + 70, dropGreen[3],
+            1);
   moveRobot(dropGreen[0], dropGreen[1], dropGreen[2], dropGreen[3], 1);
   moveRobot(dropGreen[0], dropGreen[1], dropGreen[2], dropGreen[3], 0);
   delay(200);
@@ -576,13 +578,15 @@ void GreenToFloor() {
 }
 
 void BlueToFloor() {
-  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 50, posBlue[3], 0);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 10, posBlue[3], 0);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 10, posBlue[3], 1);
+  moveRobot(posBlue[0] - 20, posBlue[1], posBlue[2] + 50, posBlue[3], 0);
+  moveRobot(posBlue[0] - 20, posBlue[1], posBlue[2] + 10, posBlue[3], 0);
+  moveRobot(posBlue[0] - 20, posBlue[1], posBlue[2] + 10, posBlue[3], 1);
   delay(200);
-  moveRobot(posBlue[0], posBlue[1], posBlue[2] + 50, posBlue[3], 1);
+  moveRobot(posBlue[0] - 20, posBlue[1], posBlue[2] + 50, posBlue[3], 1);
+  moveRobot(dropBlue[0], dropBlue[1], dropBlue[2] + 100, dropBlue[3], 1);
   moveRobot(dropBlue[0], dropBlue[1], dropBlue[2], dropBlue[3], 1);
   moveRobot(dropBlue[0], dropBlue[1], dropBlue[2], dropBlue[3], 0);
+  moveRobot(dropBlue[0], dropBlue[1], dropBlue[2] + 100, dropBlue[3], 0);
   delay(200);
   goHome();
 }
@@ -603,11 +607,12 @@ void RedToFloor() {
 void GreenToCar() {
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
-  moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 1);
-  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2], posGreen[3], 1);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 0);
-  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 0);
+  delay(100);
+  moveRobot(posRod[0], posRod[1] - 80, posRod[2] + 40, posRod[3], 1);
+  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2] + 40, posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2] + 5, posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2], posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2] + 40, posGreen[3], 0);
   delay(200);
   goHome();
 }
@@ -615,6 +620,7 @@ void GreenToCar() {
 void BlueToCar() {
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
+  delay(100);
   moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
   moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 1);
   moveRobot(posBlue[0] - 45, posBlue[1], posBlue[2], posBlue[3], 1);
@@ -689,13 +695,15 @@ void RedToPlatform() {
 // User then manually adjusts with step buttons and grips.
 void CarToPlatform() {
   Serial.println("[ACTION] Car To Platform — approach");
-  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0); // was +40
+  moveRobot(posRod[0], posRod[1], posRod[2] + 20, posRod[3], 0); // was +40
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
   Serial.println("[ACTION] At car — use step buttons to adjust, then grip");
 }
 
 // ================= DISPATCH (called from loop, NEVER from callback)
 // =================
+static volatile bool armBusy = false;
+
 static void sendArmStatus(bool busy) {
   ArmStatus st = {};
   st.type = 0;
@@ -824,9 +832,9 @@ void loop() {
                   WiFi.status() == WL_CONNECTED ? 1 : 0,
                   wsClient.isConnected() ? 1 : 0,
                   WiFi.softAPIP().toString().c_str(), ESP.getFreeHeap());
-    // Heartbeat: send idle status so base knows arm is alive
+    // Heartbeat: send current state so base knows arm is alive
     if (WiFi.status() == WL_CONNECTED) {
-      sendArmStatus(false);
+      sendArmStatus(armBusy);
     }
   }
 
@@ -837,6 +845,7 @@ void loop() {
     if (!dequeueCmd(cmd))
       break;
     if (!didWork) {
+      armBusy = true;
       sendArmStatus(true);
       didWork = true;
     }
@@ -844,6 +853,7 @@ void loop() {
     dispatchCmd(cmd);
   }
   if (didWork) {
+    armBusy = false;
     sendArmStatus(false);
   }
 
