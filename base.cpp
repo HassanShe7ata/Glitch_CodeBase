@@ -201,8 +201,12 @@ const char *stateFromVector(const int8_t vec[]) {
 #define SDA_PIN 21
 #define SCL_PIN 22
 
+// --- I2C Diagnostics ---
+static uint32_t i2cWriteFails = 0;
+static uint32_t i2cReadFails = 0;
+
 bool autonomousMode = false;
-bool autoTrigger = 0;
+int autoTrigger = 0;
 
 // --- MPU6050 DMP ---
 MPU6050 mpu;
@@ -222,6 +226,15 @@ const float TICKS_FWD_BWD = 7463.611f; // updated by 100/90 factor
 const float TICKS_STRAFE = 7581.71f;
 const float TICKS_DIAG = 9548.44f;
 const float TICKS_ROTATE = 8730.00f;
+
+// --- COMPETITION DISTANCES (meters) - update after calibration ---
+const float DIST_1 = 1.0;  // FWD to red box
+const float DIST_2 = 1.0;  // FWD to platform
+const float DIST_3 = 0.5;  // BWD centering
+const float DIST_4 = 1.0;  // RIGHT to green box
+const float DIST_5 = 1.0;  // LEFT centering
+const float DIST_6 = 1.0;  // FWD after 180 turn
+const float DIST_7 = 1.0;  // DIAG to blue box
 
 int8_t Motor_speed = 25;
 
@@ -338,66 +351,140 @@ void sendCameraPoseToArm() {
 // I2C HELPERS
 // ================================================================
 
+static void i2cBusRecover() {
+  Serial.println("[I2C] Bus recovery");
+  Wire.end();
+  pinMode(SCL_PIN, OUTPUT);
+  for (int i = 0; i < 16; i++) {
+    digitalWrite(SCL_PIN, HIGH); delayMicroseconds(5);
+    digitalWrite(SCL_PIN, LOW);  delayMicroseconds(5);
+  }
+  pinMode(SCL_PIN, INPUT);
+  Wire.begin(SDA_PIN, SCL_PIN, 100000);
+  Wire.setTimeOut(20);
+  delay(5);
+}
+
 bool writeBytes(uint8_t reg, uint8_t *data, size_t len) {
-  Wire.beginTransmission(I2C_ADDR);
-  Wire.write(reg);
-  for (size_t i = 0; i < len; i++)
-    Wire.write(data[i]);
-  return (Wire.endTransmission() == 0);
+  for (int attempt = 0; attempt < 3; attempt++) {
+    Wire.beginTransmission(I2C_ADDR);
+    Wire.write(reg);
+    for (size_t i = 0; i < len; i++)
+      Wire.write(data[i]);
+    if (Wire.endTransmission() == 0)
+      return true;
+    delay(1);
+  }
+  i2cWriteFails++;
+  if (i2cWriteFails % 20 == 1)
+    Serial.printf("[I2C] writeBytes failed %lu times\n", (unsigned long)i2cWriteFails);
+  i2cBusRecover();
+  return false;
 }
 
 bool readEncoders(int32_t *data) {
-  Wire.setClock(40000);
-  Wire.beginTransmission(I2C_ADDR);
-  Wire.write(REG_ENCODER_TOTAL);
-  if (Wire.endTransmission() != 0)
-    return false;
-  if (Wire.requestFrom((uint8_t)I2C_ADDR, (uint8_t)16) != 16)
-    return false;
-  for (int i = 0; i < 4; i++) {
-    uint32_t temp = 0;
-    temp |= (uint32_t)Wire.read();
-    temp |= (uint32_t)Wire.read() << 8;
-    temp |= (uint32_t)Wire.read() << 16;
-    temp |= (uint32_t)Wire.read() << 24;
-    data[i] = (int32_t)temp;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    Wire.beginTransmission(I2C_ADDR);
+    Wire.write(REG_ENCODER_TOTAL);
+    if (Wire.endTransmission() != 0) {
+      delay(1);
+      continue;
+    }
+    if (Wire.requestFrom((uint8_t)I2C_ADDR, (uint8_t)16) != 16) {
+      delay(1);
+      continue;
+    }
+    for (int i = 0; i < 4; i++) {
+      uint32_t temp = 0;
+      temp |= (uint32_t)Wire.read();
+      temp |= (uint32_t)Wire.read() << 8;
+      temp |= (uint32_t)Wire.read() << 16;
+      temp |= (uint32_t)Wire.read() << 24;
+      data[i] = (int32_t)temp;
+    }
+    return true;
   }
-  return true;
+  i2cReadFails++;
+  if (i2cReadFails % 20 == 1)
+    Serial.printf("[I2C] readEncoders failed %lu times\n", (unsigned long)i2cReadFails);
+  i2cBusRecover();
+  return false;
 }
 
+// --- Motor speed cache (skip identical I2C writes) ---
+static int8_t lastWrittenSpeeds[4] = {-128, -128, -128, -128};
+
+static uint32_t lastSpeedWriteMs = 0;
+#define SPEED_REFRESH_MS 100
+
 bool writeSpeeds(int8_t v1, int8_t v2, int8_t v3, int8_t v4) {
-  Wire.setClock(40000);
+  uint32_t now = millis();
+  bool speedsChanged = (v1 != lastWrittenSpeeds[0] || v2 != lastWrittenSpeeds[1] ||
+                        v3 != lastWrittenSpeeds[2] || v4 != lastWrittenSpeeds[3]);
+  bool refreshDue = (now - lastSpeedWriteMs >= SPEED_REFRESH_MS);
+
+  if (!speedsChanged && !refreshDue)
+    return true;
+
   int8_t speeds[4] = {v1, v2, v3, v4};
-  return writeBytes(REG_FIXED_SPEED, (uint8_t *)speeds, 4);
+  if (writeBytes(REG_FIXED_SPEED, (uint8_t *)speeds, 4)) {
+    lastWrittenSpeeds[0] = v1;
+    lastWrittenSpeeds[1] = v2;
+    lastWrittenSpeeds[2] = v3;
+    lastWrittenSpeeds[3] = v4;
+    lastSpeedWriteMs = now;
+    return true;
+  }
+  return false;
 }
+
+static uint32_t lastMotorDbgMs = 0;
 
 void updateMotors() {
   if (!moveActive)
     return;
   robotState = stateFromVector(moveVec);
-  updateYaw();
-  if (moveIsRotation) {
-    writeSpeeds(constrain((int)moveSpeed * moveVec[0], -100, 100),
-                constrain((int)moveSpeed * moveVec[1], -100, 100),
-                constrain((int)moveSpeed * moveVec[2], -100, 100),
-                constrain((int)moveSpeed * moveVec[3], -100, 100));
-  } else {
+
+  int8_t fl = moveSpeed * moveVec[0];
+  int8_t fr = moveSpeed * moveVec[1];
+  int8_t bl = moveSpeed * moveVec[2];
+  int8_t br = moveSpeed * moveVec[3];
+
+  if (!moveIsRotation) {
     float yawError = moveTargetHeading - currentYaw;
     if (yawError > 180)
       yawError -= 360;
     if (yawError < -180)
       yawError += 360;
-    int8_t gyroCorr = (int8_t)constrain(yawError * KP_GYRO, -127.0f, 127.0f);
-    writeSpeeds(constrain((int)(moveSpeed * moveVec[0]) + gyroCorr, -100, 100),
-                constrain((int)(moveSpeed * moveVec[1]) - gyroCorr, -100, 100),
-                constrain((int)(moveSpeed * moveVec[2]) + gyroCorr, -100, 100),
-                constrain((int)(moveSpeed * moveVec[3]) - gyroCorr, -100, 100));
+    if (fabs(yawError) > 2.0f) {
+      int8_t gyroCorr =
+          (int8_t)constrain(yawError * KP_GYRO, -127.0f, 127.0f);
+      fl += gyroCorr;
+      fr -= gyroCorr;
+      bl += gyroCorr;
+      br -= gyroCorr;
+    }
   }
+
+  int8_t ofl = constrain(fl, -100, 100);
+  int8_t ofr = constrain(fr, -100, 100);
+  int8_t obl = constrain(bl, -100, 100);
+  int8_t obr = constrain(br, -100, 100);
+
+  if (millis() - lastMotorDbgMs > 500) {
+    Serial.printf("[MOT] spd=%d vec=[%d,%d,%d,%d] yaw=%.1f tgt=%.1f fl=%d fr=%d bl=%d br=%d\n",
+                  (int)moveSpeed, (int)moveVec[0], (int)moveVec[1], (int)moveVec[2], (int)moveVec[3],
+                  currentYaw, moveTargetHeading, (int)ofl, (int)ofr, (int)obl, (int)obr);
+    lastMotorDbgMs = millis();
+  }
+
+  writeSpeeds(ofl, ofr, obl, obr);
 }
 
 void forceStop() {
   moveActive = false;
   robotState = "Idle";
+  lastWrittenSpeeds[0] = -128;
   for (int i = 0; i < 5; i++) {
     if (writeSpeeds(0, 0, 0, 0)) {
       break;
@@ -407,28 +494,11 @@ void forceStop() {
 }
 
 // ================================================================
-// MECANUM WHEEL MIXING (for binary protocol compatibility)
-// ================================================================
-
-void computeMecanumSpeeds(int8_t throttle, int8_t steering, int8_t rotation,
-                          int8_t speeds[4]) {
-  int16_t fl = (int16_t)throttle - (int16_t)steering + (int16_t)rotation;
-  int16_t fr = -(int16_t)throttle - (int16_t)steering + (int16_t)rotation;
-  int16_t bl = -(int16_t)throttle + (int16_t)steering + (int16_t)rotation;
-  int16_t br = (int16_t)throttle + (int16_t)steering + (int16_t)rotation;
-  speeds[0] = (int8_t)constrain(fl, -100, 100);
-  speeds[1] = (int8_t)constrain(fr, -100, 100);
-  speeds[2] = (int8_t)constrain(bl, -100, 100);
-  speeds[3] = (int8_t)constrain(br, -100, 100);
-}
-
-// ================================================================
 // MPU6050 DMP
 // ================================================================
 
 void updateYaw() {
   if (dmpReady) {
-    Wire.setClock(400000);
     if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
       mpu.dmpGetQuaternion(&q, fifoBuffer);
       mpu.dmpGetGravity(&gravity, &q);
@@ -460,6 +530,8 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
   uint8_t i2cErrors = 0;
 
   while (true) {
+    server.handleClient();
+    wsServer.loop();
     updateYaw();
 
     if (loopCounter % 2 == 0) {
@@ -527,6 +599,8 @@ void rotateDegrees(bool clockwise, float degrees, int8_t maxSpeed) {
       clockwise ? (startHeading + degrees) : (startHeading - degrees);
 
   while (true) {
+    server.handleClient();
+    wsServer.loop();
     updateYaw();
     float yawError = target - currentYaw;
     if (yawError > 180)
@@ -571,6 +645,8 @@ static bool waitForCameraPose(unsigned long timeout_ms, PoseReply *out) {
   sendScanRequest(0);
   unsigned long t0 = millis();
   while (millis() - t0 < timeout_ms) {
+    server.handleClient();
+    wsServer.loop();
     if (!autonomousMode)
       return false;
     if (cameraPoseReceived) {
@@ -786,16 +862,6 @@ void handleCommand(const String &msg) {
         moveActive = true;
       }
     }
-  } else if (cmd == "STEP") {
-    if (!autonomousMode && !pendingStep) {
-      pendingStep = true;
-      stepArg = arg;
-    }
-  } else if (cmd == "ROTATE90") {
-    if (!autonomousMode && !pendingStep) {
-      pendingStep = true;
-      stepArg = (arg == "CCW") ? "ROT90CCW" : "ROT90CW";
-    }
   } else if (cmd == "POSE") {
     if (!autonomousMode && !pendingStep) {
       pendingStep = true;
@@ -821,16 +887,29 @@ void handleCommand(const String &msg) {
     snprintf(armCmd, sizeof(armCmd), "SV:%d:%d", joint, val);
     sendCommandToArm(armCmd);
   } else if (cmd == "AUTO") {
-    if (arg == "TOGGLE") {
+    if (arg == "CALIBRATE") {
+      autonomousMode = true;
+      autoTrigger = 1;
+      Serial.println("[AUTO] CALIBRATION MODE");
+    } else if (arg == "COMPETE") {
+      autonomousMode = true;
+      autoTrigger = 2;
+      Serial.println("[AUTO] COMPETITION MODE");
+    } else if (arg == "TOGGLE") {
       autonomousMode = !autonomousMode;
+      if (autonomousMode) {
+        autoTrigger = 1;
+        Serial.println("AUTONOMOUS MODE (default: calibrate)");
+      } else {
+        Serial.println("MANUAL MODE");
+      }
     } else {
       autonomousMode = (arg == "ON");
-    }
-    if (autonomousMode) {
-      autoTrigger = 1;
-      Serial.println("AUTONOMOUS MODE");
-    } else {
-      Serial.println("MANUAL MODE");
+      if (autonomousMode) {
+        autoTrigger = 1;
+      } else {
+        Serial.println("MANUAL MODE");
+      }
     }
     forceStop();
   } else if (cmd == "SCAN") {
@@ -1061,6 +1140,9 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         .btn-auto{background:#f59e0b;border-color:#f59e0b;color:#000;font-size:16px;font-weight:700;width:100%;margin-bottom:8px}
         .btn-auto:active{background:#d97706;box-shadow:0 0 12px rgba(245,158,11,0.5)}
         .btn-auto.active{background:#ef4444;border-color:#ef4444;color:#fff}
+        .btn-cal{background:#22d3ee;border-color:#22d3ee;color:#000;font-size:14px;font-weight:700;width:100%;margin-bottom:4px}
+        .btn-cal:active{background:#06b6d4;box-shadow:0 0 12px rgba(34,211,238,0.5)}
+        .btn-cal.active{background:#ef4444;border-color:#ef4444;color:#fff}
     </style>
 </head>
 <body>
@@ -1135,7 +1217,8 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
 
     <div class="card">
         <h2>Mode</h2>
-        <button id="btnAuto" class="btn-auto" data-cmd="AUTO" data-arg="TOGGLE">START AUTONOMOUS</button>
+        <button id="btnCalibrate" class="btn-cal" data-cmd="AUTO" data-arg="CALIBRATE">CALIBRATE</button>
+        <button id="btnCompete" class="btn-auto" data-cmd="AUTO" data-arg="COMPETE">COMPETITION</button>
         <button id="btnScanQR" data-cmd="SCAN" data-arg="QR" style="width:100%">Scan QR</button>
     </div>
     </div>
@@ -1188,11 +1271,15 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
                 setArmBusy(s.arm_busy);
 
                 if(s.autonomous){
-                    $('btnAuto').classList.add('active');
-                    $('btnAuto').textContent='RUNNING...';
+                    $('btnCalibrate').classList.add('active');
+                    $('btnCompete').classList.add('active');
+                    $('btnCalibrate').textContent='RUNNING...';
+                    $('btnCompete').textContent='RUNNING...';
                 }else{
-                    $('btnAuto').classList.remove('active');
-                    $('btnAuto').textContent='START AUTONOMOUS';
+                    $('btnCalibrate').classList.remove('active');
+                    $('btnCompete').classList.remove('active');
+                    $('btnCalibrate').textContent='CALIBRATE';
+                    $('btnCompete').textContent='COMPETITION';
                 }
 
                 if(s.current_yaw!=null)$('heading').textContent=parseFloat(s.current_yaw).toFixed(1)+'\u00B0';
@@ -1258,7 +1345,7 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
             if(b.closest('.pad')||b.id==='btnScanQR')return;
             b.addEventListener('click',function(){send({cmd:b.dataset.cmd,arg:b.dataset.arg})});
         });
-        // btnAuto handled by generic data-cmd handler + pollStatus()
+        // btnCalibrate/btnCompete handled by generic data-cmd handler + pollStatus()
         $('btnScanQR').addEventListener('click',function(){
             if(scanActive){
                 send({cmd:'SCAN',arg:'STOP'});
@@ -1623,9 +1710,9 @@ drawMap(); drawCompass();
 void setup() {
   Serial.begin(115200);
 
-  // I2C: Start at 400kHz for MPU6050 DMP init
-  Wire.begin(SDA_PIN, SCL_PIN, 400000);
-  Wire.setTimeOut(200);
+  // I2C: 100kHz — safe for both MPU6050 and Hiwonder motor driver
+  Wire.begin(SDA_PIN, SCL_PIN, 100000);
+  Wire.setTimeOut(20);
   delay(500);
 
   // MPU6050 DMP init
@@ -1639,9 +1726,6 @@ void setup() {
   } else {
     Serial.println("MPU6050 DMP INIT FAILED");
   }
-
-  // Switch to 40kHz for motor driver
-  Wire.setClock(40000);
 
   // Motor driver init (type=3, polarity=0 = normal 4-wheel mecanum)
   uint8_t motorType = 3;
@@ -1796,15 +1880,19 @@ void loop() {
   server.handleClient();
   wsServer.loop();
 
-  // =================== IMU UPDATE (once per loop) ===================
-  updateYaw();
-
-  // =================== ENCODER DEAD RECKONING ===================
-  updateDeadReckoning();
-
-  // =================== CONTINUOUS MOVEMENT ===================
-  if (!autonomousMode)
-    updateMotors();
+  // =================== I2C: MOTOR-ONLY DURING MANUAL DRIVE ===================
+  if (!autonomousMode) {
+    updateYaw();
+    if (moveActive) {
+      delayMicroseconds(200);
+      updateMotors();
+    } else {
+      updateDeadReckoning();
+    }
+  } else {
+    updateYaw();
+    updateDeadReckoning();
+  }
 
   // =================== SCAN TIMEOUT WATCHDOG ===================
   if (scanInProgress && millis() - scanStartMs > 40000) {
@@ -1846,37 +1934,11 @@ void loop() {
     Serial.printf("[ARM] Status: busy=%d\n", st.busy);
   }
 
-  // =================== STEP HANDLER ===================
+  // =================== STEP HANDLER (POSE only) ===================
   if (pendingStep && !moveActive) {
-    float stepDist = 0.05;
-    float stepDeg = 15.0;
-    if (stepArg == "FWD") {
-      moveDistanceKp(V_FORWARD, Motor_speed, stepDist, TICKS_FWD_BWD);
-    } else if (stepArg == "BACK") {
-      moveDistanceKp(V_BACKWARD, Motor_speed, stepDist, TICKS_FWD_BWD);
-    } else if (stepArg == "LEFT") {
-      moveDistanceKp(V_STRAFE_L, Motor_speed, stepDist, TICKS_STRAFE);
-    } else if (stepArg == "RIGHT") {
-      moveDistanceKp(V_STRAFE_R, Motor_speed, stepDist, TICKS_STRAFE);
-    } else if (stepArg == "ROTCW") {
-      rotateDegrees(true, stepDeg, Motor_speed);
-    } else if (stepArg == "ROTCCW") {
-      rotateDegrees(false, stepDeg, Motor_speed);
-    } else if (stepArg == "DIAGFR") {
-      moveDistanceKp(V_DIAG_FR, Motor_speed, stepDist, TICKS_DIAG);
-    } else if (stepArg == "DIAGFL") {
-      moveDistanceKp(V_DIAG_FL, Motor_speed, stepDist, TICKS_DIAG);
-    } else if (stepArg == "DIAGBR") {
-      moveDistanceKp(V_DIAG_BR, Motor_speed, stepDist, TICKS_DIAG);
-    } else if (stepArg == "DIAGBL") {
-      moveDistanceKp(V_DIAG_BL, Motor_speed, stepDist, TICKS_DIAG);
-    } else if (stepArg == "ROT90CW") {
-      rotateDegrees(true, 90.0, Motor_speed);
-    } else if (stepArg == "ROT90CCW") {
-      rotateDegrees(false, 90.0, Motor_speed);
-    } else if (stepArg.startsWith("POSE:")) {
-      float targetHeading = stepArg.substring(5).toFloat();
-      rotateToHeading(targetHeading, Motor_speed);
+    if (stepArg.startsWith("POSE:")) {
+      float heading = stepArg.substring(5).toFloat();
+      rotateToHeading(heading, Motor_speed);
     }
     pendingStep = false;
   }
@@ -1891,60 +1953,135 @@ void loop() {
         (unsigned long)espNowRecvMatchPose);
   }
 
-  // =================== AUTONOMOUS SEQUENCE ===================
-  // Fixed competition sequence — runs to completion once started.
-  // To modify: change distances (meters), arm commands, or step order.
-  // Each step: movement (vector + distance in meters) or arm action (command +
-  // wait). Sequence: FWD 1m -> Red->Plat -> LEFT 1m -> BACK 1m -> Blue->Plat
-  //           -> RIGHT 1m -> Green->Plat -> DIAG 1m
+  // =================== AUTONOMOUS SEQUENCES ===================
+  // autoTrigger 1 = Calibration (test moves for recording)
+  // autoTrigger 2 = Competition (full task sequence)
   // Toggle autonomous OFF to stop mid-sequence.
+
+  // --- CALIBRATION SEQUENCE ---
   if (autonomousMode && autoTrigger == 1) {
     autoTrigger = 0;
-    Serial.println("[AUTO] === Starting fixed autonomous sequence ===");
+    Serial.println("[AUTO] === Starting calibration sequence ===");
 
-    // --- Step 1: Move FORWARD 1 meter ---
-    Serial.println("[AUTO] Step 1: Forward 1m");
+    Serial.println("[AUTO] Step 1: Forward 1m (record encoder data)");
     moveDistanceKp(V_FORWARD, Motor_speed, 1.0, TICKS_FWD_BWD);
+    if (!autonomousMode)
+      goto calEnd;
+
+    Serial.println("[AUTO] Step 2: Rotate 90 CW");
+    rotateDegrees(true, 90, Motor_speed);
+    if (!autonomousMode)
+      goto calEnd;
+
+    Serial.println("[AUTO] Step 3: Rotate 90 CCW (back to 0)");
+    rotateDegrees(false, 90, Motor_speed);
+    if (!autonomousMode)
+      goto calEnd;
+
+    Serial.println("[AUTO] === Calibration sequence complete ===");
+  calEnd:
+    forceStop();
+    autonomousMode = false;
+    Serial.println("[AUTO] Autonomous sequence ended");
+  }
+
+  // --- COMPETITION SEQUENCE ---
+  if (autonomousMode && autoTrigger == 2) {
+    autoTrigger = 0;
+    Serial.println("[AUTO] === Starting competition sequence ===");
+
+    // Step 1: FWD to red box
+    Serial.println("[AUTO] Step 1: Forward to red box");
+    moveDistanceKp(V_FORWARD, Motor_speed, DIST_1, TICKS_FWD_BWD);
     if (!autonomousMode)
       goto autoEnd;
 
-    /*
-    CommandToArm("RTP");
+    // Step 2: Rotate 90 CCW
+    Serial.println("[AUTO] Step 2: Rotate 90 CCW");
+    rotateDegrees(false, 90, Motor_speed);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    // Step 3: Pose correction to 0
+    Serial.println("[AUTO] Step 3: Pose correction to 0");
+    rotateToHeading(0, Motor_speed);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    // Step 4: FWD to platform
+    Serial.println("[AUTO] Step 4: Forward to platform");
+    moveDistanceKp(V_FORWARD, Motor_speed, DIST_2, TICKS_FWD_BWD);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    // Step 5: Red to Platform
+    Serial.println("[AUTO] Step 5: Red -> Platform");
+    sendCommandToArm("RTP");
     waitForArmIdle(20000);
-    if (!autonomousMode) goto autoEnd;
+    if (!autonomousMode)
+      goto autoEnd;
 
-    // --- Step 3: Move LEFT 1 meter ---
-    Serial.println("[AUTO] Step 3: Left 1m");
-    moveDistanceKp(V_STRAFE_L, Motor_speed, 1.0, TICKS_STRAFE);
-    if (!autonomousMode) goto autoEnd;
+    // Step 6: BWD centering
+    Serial.println("[AUTO] Step 6: Backward centering");
+    moveDistanceKp(V_BACKWARD, Motor_speed, DIST_3, TICKS_FWD_BWD);
+    if (!autonomousMode)
+      goto autoEnd;
 
-    // --- Step 4: Move BACKWARD 1 meter ---
-    Serial.println("[AUTO] Step 4: Backward 1m");
-    moveDistanceKp(V_BACKWARD, Motor_speed, 1.0, TICKS_FWD_BWD);
-    if (!autonomousMode) goto autoEnd;
+    // Step 7: Pose correction to 0
+    Serial.println("[AUTO] Step 7: Pose correction to 0");
+    rotateToHeading(0, Motor_speed);
+    if (!autonomousMode)
+      goto autoEnd;
 
-    // --- Step 5: Drop BLUE box on platform ---
-    Serial.println("[AUTO] Step 5: Blue -> Platform");
-    sendCommandToArm("BTP");
-    waitForArmIdle(20000);
-    if (!autonomousMode) goto autoEnd;
+    // Step 8: RIGHT to green box
+    Serial.println("[AUTO] Step 8: Right to green box");
+    moveDistanceKp(V_STRAFE_R, Motor_speed, DIST_4, TICKS_STRAFE);
+    if (!autonomousMode)
+      goto autoEnd;
 
-    // --- Step 6: Move RIGHT 1 meter ---
-    Serial.println("[AUTO] Step 6: Right 1m");
-    moveDistanceKp(V_STRAFE_R, Motor_speed, 1.0, TICKS_STRAFE);
-    if (!autonomousMode) goto autoEnd;
-
-    // --- Step 7: Drop GREEN box on platform ---
-    Serial.println("[AUTO] Step 7: Green -> Platform");
+    // Step 9: Green to Platform
+    Serial.println("[AUTO] Step 9: Green -> Platform");
     sendCommandToArm("GTP");
     waitForArmIdle(20000);
-    if (!autonomousMode) goto autoEnd;
+    if (!autonomousMode)
+      goto autoEnd;
 
-    // --- Step 8: Move DIAGONAL (forward-right) 1 meter ---
-    Serial.println("[AUTO] Step 8: Diagonal 1m");
-    moveDistanceKp(V_DIAG_FR, Motor_speed, 1.0, TICKS_DIAG);
-*/
-    Serial.println("[AUTO] === Sequence complete ===");
+    // Step 10: LEFT centering
+    Serial.println("[AUTO] Step 10: Left centering");
+    moveDistanceKp(V_STRAFE_L, Motor_speed, DIST_5, TICKS_STRAFE);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    // Step 11: Rotate 180
+    Serial.println("[AUTO] Step 11: Rotate 180");
+    rotateDegrees(true, 180, Motor_speed);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    // Step 12: Pose correction to 180
+    Serial.println("[AUTO] Step 12: Pose correction to 180");
+    rotateToHeading(180, Motor_speed);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    // Step 13: FWD
+    Serial.println("[AUTO] Step 13: Forward");
+    moveDistanceKp(V_FORWARD, Motor_speed, DIST_6, TICKS_FWD_BWD);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    // Step 14: DIAG to blue box
+    Serial.println("[AUTO] Step 14: Diagonal to blue box");
+    moveDistanceKp(V_DIAG_FR, Motor_speed, DIST_7, TICKS_DIAG);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    // Step 15: Blue to Platform
+    Serial.println("[AUTO] Step 15: Blue -> Platform");
+    sendCommandToArm("BTP");
+    waitForArmIdle(20000);
+
+    Serial.println("[AUTO] === Competition sequence complete ===");
   autoEnd:
     forceStop();
     autonomousMode = false;

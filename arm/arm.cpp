@@ -6,10 +6,10 @@
 
 #include <Adafruit_PWMServoDriver.h>
 #include <Arduino.h>
-#include <WiFi.h>
-#include <Wire.h>
 #include <WebServer.h>
 #include <WebSocketsClient.h>
+#include <WiFi.h>
+#include <Wire.h>
 #include <esp_wifi.h>
 #include <math.h>
 
@@ -123,7 +123,8 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
 }
 // ================= BASE WEBSOCKET =================
 
-// ================= LOCAL HTTP SERVER (fallback when base is off) =================
+// ================= LOCAL HTTP SERVER (fallback when base is off)
+// =================
 static WebServer localServer(80);
 
 static const char ARM_PAGE[] PROGMEM = R"rawliteral(
@@ -210,9 +211,7 @@ document.querySelectorAll('.step-btn').forEach(function(btn){
 </script></body></html>
 )rawliteral";
 
-static void handleRoot() {
-  localServer.send_P(200, "text/html", ARM_PAGE);
-}
+static void handleRoot() { localServer.send_P(200, "text/html", ARM_PAGE); }
 
 static void handleCmd() {
   String c = localServer.arg("c");
@@ -229,7 +228,8 @@ static void handleCmd() {
 static void handleStatus() {
   String json = "{";
   json += "\"ws\":" + String(wsClient.isConnected() ? "true" : "false");
-  json += ",\"base\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
+  json +=
+      ",\"base\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
   json += ",\"free\":" + String(ESP.getFreeHeap());
   json += "}";
   localServer.send(200, "application/json", json);
@@ -261,10 +261,10 @@ const long MIN_MOVE_DURATION = 300;
 float posGreen[4] = {0, 100, 55, -100};
 float posBlue[4] = {-100, 50, 55, -100}; // first number was -90
 float posRed[4] = {100, 50, 55, -100};   // first number was 90
-float posRod[4] = {0, 260, 200, 0};
-float dropGreen[4] = {0, 235, 0, -90};
-float dropBlue[4] = {0, 235, 0, -90};
-float dropRed[4] = {-235, 0, 0, -90};
+float posRod[4] = {0, 260, 241, 0};
+float dropGreen[4] = {235, 0, 0, -90};  // right of car
+float dropBlue[4] = {166, 166, 0, -90}; // diagonal right 45°
+float dropRed[4] = {0, 235, 0, -90};    // front of car
 
 // ================= GLOBAL STATE =================
 float currentAngle[NUM_SERVOS] = {90, 170, 180, 100, GRIP_OPEN};
@@ -610,13 +610,13 @@ void GreenToCar() {
   delay(200);
   goHome();
 }
-
+// msh mzboot
 void BlueToCar() {
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
   moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
   moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 1);
-  moveRobot(posBlue[0] - 20, posBlue[1] + 20, posBlue[2], posBlue[3], 1);
+  moveRobot(posBlue[0] - 45, posBlue[1] + 15, posBlue[2], posBlue[3], 1);
   moveRobot(posBlue[0], posBlue[1], posBlue[2], posBlue[3], 0);
   moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 0);
   delay(200);
@@ -628,7 +628,7 @@ void RedToCar() {
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
   moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
   moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 1);
-  moveRobot(posRed[0] + 20, posRed[1] + 20, posRed[2], posRed[3], 1);
+  moveRobot(posRed[0] + 30, posRed[1] + 30, posRed[2], posRed[3], 1);
   moveRobot(posRed[0], posRed[1], posRed[2], posRed[3], 0);
   moveRobot(posRed[0], posRed[1], posRed[2] + 40, posRed[3], 0);
   delay(200);
@@ -688,7 +688,7 @@ void RedToPlatform() {
 // User then manually adjusts with step buttons and grips.
 void CarToPlatform() {
   Serial.println("[ACTION] Car To Platform — approach");
-  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0);
+  moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 0); // was +40
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 0);
   Serial.println("[ACTION] At car — use step buttons to adjust, then grip");
 }
@@ -775,7 +775,8 @@ void setup() {
 
   // WiFi AP+STA mode — own AP always on, STA tries to connect to base
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAPConfig(IPAddress(192, 168, 5, 1), IPAddress(192, 168, 5, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAPConfig(IPAddress(192, 168, 5, 1), IPAddress(192, 168, 5, 1),
+                    IPAddress(255, 255, 255, 0));
   WiFi.softAP("GLITCH-ARM", "Gl1tch2024!Secure", 11);
   Serial.printf("[ARM] AP: %s ch=11\n", WiFi.softAPIP().toString().c_str());
 
@@ -787,8 +788,7 @@ void setup() {
   }
   esp_wifi_set_ps(WIFI_PS_NONE);
 
-  Serial.printf("[ARM] MAC: %s  STA: %s  AP: %s\n",
-                WiFi.macAddress().c_str(),
+  Serial.printf("[ARM] MAC: %s  STA: %s  AP: %s\n", WiFi.macAddress().c_str(),
                 (WiFi.status() == WL_CONNECTED) ? "OK" : "DOWN",
                 WiFi.softAPIP().toString().c_str());
 
@@ -811,9 +811,9 @@ void loop() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    wsClient.loop();  // Only poll WebSocket when STA is up
+    wsClient.loop(); // Only poll WebSocket when STA is up
   }
-  localServer.handleClient();  // Always process local HTTP requests
+  localServer.handleClient(); // Always process local HTTP requests
   checkWifi();
 
   static unsigned long lastStatus = 0;
@@ -822,8 +822,7 @@ void loop() {
     Serial.printf("[ARM] STA=%d WS=%d AP=%s free=%d\n",
                   WiFi.status() == WL_CONNECTED ? 1 : 0,
                   wsClient.isConnected() ? 1 : 0,
-                  WiFi.softAPIP().toString().c_str(),
-                  ESP.getFreeHeap());
+                  WiFi.softAPIP().toString().c_str(), ESP.getFreeHeap());
     // Heartbeat: send idle status so base knows arm is alive
     if (WiFi.status() == WL_CONNECTED) {
       sendArmStatus(false);

@@ -995,17 +995,26 @@ static void process_qr_frame() {
     esp_camera_fb_return(fb);
     xSemaphoreGive(g_cam_mutex);
 
-    if (!g_proc_buf || !g_proc_gray_buf) return;
+    if (!g_proc_gray_buf) return;
 
-    downsample_gray(g_gray_buf, w, h, g_proc_raw_buf);
-    memcpy(g_proc_gray_buf, g_proc_raw_buf, g_proc_w * g_proc_h);
-    contrast_stretch(g_proc_gray_buf, g_proc_w * g_proc_h);
+    // --- Build the raw grayscale source buffer ---
+    // When DOWNSCALE=1, g_gray_buf IS the processing-resolution image —
+    // skip the downsample memcpy entirely.
+    uint8_t *raw = g_gray_buf;
+    if (QR_DOWNSCALE > 1) {
+        downsample_gray(g_gray_buf, w, h, g_proc_raw_buf);
+        raw = g_proc_raw_buf;
+    }
 
-    // Quirc-native main pass: raw grayscale first. Heavier preprocessing is
-    // retained in fallback passes to recover difficult frames.
-    memcpy(g_proc_buf, g_proc_raw_buf, g_proc_w * g_proc_h);
+    // --- Pass 1: raw grayscale ---
+    // run_quirc_scan copies src into quirc's internal buffer (read-only on src),
+    // so pass raw directly — no intermediate copy to g_proc_buf needed.
+    // If adaptive binarize is enabled for the main pass, we do need a mutable copy.
+    uint8_t *pass1_src = raw;
     if (QR_USE_ADAPTIVE_BINARIZE && QR_MAIN_USE_ADAPTIVE) {
+        memcpy(g_proc_buf, raw, g_proc_w * g_proc_h);
         adaptive_binarize(g_proc_buf, g_proc_w, g_proc_h);
+        pass1_src = g_proc_buf;
     }
 
     QRDetection *dets = g_scan_dets;
@@ -1013,7 +1022,7 @@ static void process_qr_frame() {
     uint32_t now_ms = millis();
     int count = 0;
     int decoded_ok = 0;
-    run_quirc_scan(g_proc_buf, dets, valid, count, decoded_ok);
+    run_quirc_scan(pass1_src, dets, valid, count, decoded_ok);
 
     // Early exit: if pass 1 decoded successfully, skip all retry passes
     static uint32_t s_decode_fail_streak = 0;
@@ -1030,7 +1039,11 @@ static void process_qr_frame() {
     }
 
     // Pass 2: contrast-stretched grayscale (final retry — passes 3/4 removed for speed)
+    // Deferred: only prepare g_proc_gray_buf when pass 2 is actually needed.
     if (run_retry_passes) {
+        memcpy(g_proc_gray_buf, raw, g_proc_w * g_proc_h);
+        contrast_stretch(g_proc_gray_buf, g_proc_w * g_proc_h);
+
         int alt_valid = 0;
         int alt_count = 0;
         int alt_decoded_ok = 0;
