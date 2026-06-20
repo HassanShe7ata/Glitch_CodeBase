@@ -171,6 +171,14 @@ int8_t moveSpeed = 0;
 float moveTargetHeading = 0;
 bool moveIsRotation = false;
 
+// --- HEADING PID (gyro correction during linear movement) ---
+const float KP_HEADING = 0.5f;
+const float KI_HEADING = 0.04f;
+const float KD_HEADING = 5.0f;
+const float I_MAX_HEADING = 40.0f;
+static float headingIntegral = 0.0f;
+static float headingPrevError = 0.0f;
+
 // --- ROBOT STATE ---
 String robotState = "Idle";
 
@@ -457,13 +465,17 @@ void updateMotors() {
     if (yawError < -180)
       yawError += 360;
     if (fabs(yawError) > 2.0f) {
-      int8_t gyroCorr =
-          (int8_t)constrain(yawError * KP_GYRO, -127.0f, 127.0f);
-      fl += gyroCorr;
-      fr -= gyroCorr;
-      bl += gyroCorr;
-      br -= gyroCorr;
+      headingIntegral += yawError;
+      headingIntegral = constrain(headingIntegral, -I_MAX_HEADING, I_MAX_HEADING);
+      float dError = yawError - headingPrevError;
+      float gyroCorr = KP_HEADING * yawError + KI_HEADING * headingIntegral + KD_HEADING * dError;
+      int8_t corr = (int8_t)constrain(gyroCorr, -127.0f, 127.0f);
+      fl += corr;
+      fr -= corr;
+      bl += corr;
+      br -= corr;
     }
+    headingPrevError = yawError;
   }
 
   int8_t ofl = constrain(fl, -100, 100);
@@ -522,6 +534,8 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
 
   updateYaw();
   targetHeading = currentYaw;
+  headingIntegral = 0.0f;
+  headingPrevError = 0.0f;
 
   if (!readEncoders(startEncoders))
     return;
@@ -574,12 +588,17 @@ void moveDistanceKp(const int8_t vector[], int8_t maxSpeed, float distance,
       yawError -= 360;
     if (yawError < -180)
       yawError += 360;
-    int8_t gyroCorr = (int8_t)constrain(yawError * KP_GYRO, -127.0f, 127.0f);
+    headingIntegral += yawError;
+    headingIntegral = constrain(headingIntegral, -I_MAX_HEADING, I_MAX_HEADING);
+    float dError = yawError - headingPrevError;
+    float gyroCorr = KP_HEADING * yawError + KI_HEADING * headingIntegral + KD_HEADING * dError;
+    int8_t corr = (int8_t)constrain(gyroCorr, -127.0f, 127.0f);
+    headingPrevError = yawError;
 
-    writeSpeeds(constrain((int)(baseSpeed * vector[0]) + gyroCorr, -100, 100),
-                constrain((int)(baseSpeed * vector[1]) - gyroCorr, -100, 100),
-                constrain((int)(baseSpeed * vector[2]) + gyroCorr, -100, 100),
-                constrain((int)(baseSpeed * vector[3]) - gyroCorr, -100, 100));
+    writeSpeeds(constrain((int)(baseSpeed * vector[0]) + corr, -100, 100),
+                constrain((int)(baseSpeed * vector[1]) - corr, -100, 100),
+                constrain((int)(baseSpeed * vector[2]) + corr, -100, 100),
+                constrain((int)(baseSpeed * vector[3]) - corr, -100, 100));
 
     if (loopCounter > MOVE_TIMEOUT_ITERATIONS) {
       Serial.println("[ERR] Move timed out (blocked or stalled), aborting");
@@ -880,6 +899,8 @@ void handleCommand(const String &msg) {
         if (!isRotation) {
           updateYaw();
           moveTargetHeading = currentYaw;
+          headingIntegral = 0.0f;
+          headingPrevError = 0.0f;
         }
         robotState = stateFromVector(vec);
         moveActive = true;
