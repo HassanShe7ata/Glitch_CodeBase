@@ -29,12 +29,13 @@ static uint8_t baseAddress[] = {0x80, 0xF3, 0xDA, 0x42, 0x3E, 0x5D}; // base AP 
 #define LED_FLASH_PIN -1
 
 // QR preprocessing and detection quality controls.
-// Downscale=2 is currently the best latency/robustness compromise for GC2145.
+// DOWNSCALE=1: full 640x480 for reliable quirc decode at all distances.
 #define QR_DOWNSCALE 1
 #define QR_USE_ADAPTIVE_BINARIZE 1
 #define QR_MAIN_USE_ADAPTIVE 0
 
 #define QR_SIZE_MM 50.0f
+#define QR_SIZE_SMALL_MM 45.0f
 #define CAMERA_FOV_DEG 62.0f
 #define MAX_QR_DETECTIONS 8
 #define MAX_QR_TEXT_LEN 256
@@ -231,7 +232,7 @@ static uint8_t g_last_sent_color = 0;
 static bool g_initial_sent = false;
 
 // Scan accumulation thresholds
-#define SCAN_STABLE_FRAMES     7        // consecutive stable frames before DONE
+#define SCAN_STABLE_FRAMES     5        // consecutive stable frames before DONE
 #define SCAN_TIMEOUT_MS        10000UL  // max scan duration per attempt (10 seconds)
 #define SCAN_MAX_RETRIES       3        // auto-retry on timeout with no detection
 #define SCAN_MIN_CONFIDENCE    0.65f    // min tracker confidence for stability
@@ -279,7 +280,7 @@ static QRTrackState g_track = {0};
 #define TRACK_MAX_HOLD_MS 3500U
 #define TRACK_DECAY_TAU_MS 2600.0f
 #define TRACK_MIN_CONF 0.10f
-#define OBS_ACCEPT_PROB 0.15f
+#define OBS_ACCEPT_PROB 0.12f
 
 // Robustness-first but decode-enabled: user prefers payload visibility over speed.
 #define ENABLE_PAYLOAD_DECODE 1
@@ -788,11 +789,11 @@ static void rotation_to_euler(const float R[3][3], float &roll, float &pitch, fl
     yaw = wrap_angle_deg(yaw);
 }
 
-// Estimate QR pose from 2D corners using known physical QR size and camera intrinsics.
-static bool compute_qr_pose(const float corners[4][2], const CameraIntrinsics &K, QRDetection &det) {
-    float half = QR_SIZE_MM * 0.5f;
-    // QR object points (meters in mm units here), centered on QR plane.
-    // Order matches canonical image order: TL, TR, BR, BL.
+// Estimate QR pose from 2D corners using a given physical QR size and camera intrinsics.
+static bool compute_qr_pose_sized(const float corners[4][2], const CameraIntrinsics &K,
+                                   float size_mm, float &tx, float &ty, float &tz,
+                                   float &roll, float &pitch, float &yaw) {
+    float half = size_mm * 0.5f;
     float world[4][2] = {
         {-half,  half},
         { half,  half},
@@ -813,10 +814,74 @@ static bool compute_qr_pose(const float corners[4][2], const CameraIntrinsics &K
     if (!compute_homography(world, norm_img, H)) return false;
     if (!decompose_homography(H, R, t)) return false;
 
-    det.tx = t[0];
-    det.ty = t[1];
-    det.tz = t[2];
-    rotation_to_euler(R, det.roll, det.pitch, det.yaw);
+    tx = t[0]; ty = t[1]; tz = t[2];
+    rotation_to_euler(R, roll, pitch, yaw);
+    return true;
+}
+
+// Compute reprojection RMS error to judge which size fits better.
+static float reproj_error(const float corners[4][2], const CameraIntrinsics &K,
+                           float size_mm, float tx, float ty, float tz,
+                           float roll, float pitch, float yaw) {
+    float half = size_mm * 0.5f;
+    float world[4][2] = {
+        {-half,  half}, { half,  half},
+        { half, -half}, {-half, -half},
+    };
+    float cr = cosf(roll * M_PI / 180.0f), sr = sinf(roll * M_PI / 180.0f);
+    float cp = cosf(pitch * M_PI / 180.0f), sp = sinf(pitch * M_PI / 180.0f);
+    float cy = cosf(yaw * M_PI / 180.0f), sy = sinf(yaw * M_PI / 180.0f);
+    float R[3][3] = {
+        {cy*cr + sy*sp*sr, -cy*sr + sy*sp*cr, sy*cp},
+        {cp*sr,            cp*cr,            -sp},
+        {-sy*cr + cy*sp*sr,  sy*sr + cy*sp*cr, cy*cp}
+    };
+
+    float err2_sum = 0;
+    for (int i = 0; i < 4; i++) {
+        float X = world[i][0], Y = world[i][1];
+        float rx = R[0][0]*X + R[0][1]*Y + tx;
+        float ry = R[1][0]*X + R[1][1]*Y + ty;
+        float rz = R[2][0]*X + R[2][1]*Y + tz;
+        if (rz < 1e-3f) rz = 1e-3f;
+        float u_proj = K.fx * (rx / rz) + K.cx;
+        float v_proj = K.fy * (ry / rz) + K.cy;
+        float du = u_proj - corners[i][0];
+        float dv = v_proj - corners[i][1];
+        err2_sum += du*du + dv*dv;
+    }
+    return sqrtf(err2_sum / 4.0f);
+}
+
+// Estimate QR pose from 2D corners using known physical QR size and camera intrinsics.
+// Tries both 50mm and 45mm sizes, picks the one with lower reprojection error.
+static bool compute_qr_pose(const float corners[4][2], const CameraIntrinsics &K, QRDetection &det) {
+    float tx, ty, tz, roll, pitch, yaw;
+
+    if (!compute_qr_pose_sized(corners, K, QR_SIZE_MM, tx, ty, tz, roll, pitch, yaw))
+        return false;
+
+    float err_nominal = reproj_error(corners, K, QR_SIZE_MM, tx, ty, tz, roll, pitch, yaw);
+    float err_small = reproj_error(corners, K, QR_SIZE_SMALL_MM,
+        tx * (QR_SIZE_SMALL_MM / QR_SIZE_MM),
+        ty * (QR_SIZE_SMALL_MM / QR_SIZE_MM),
+        tz * (QR_SIZE_SMALL_MM / QR_SIZE_MM),
+        roll, pitch, yaw);
+
+    // Also compute full pose with small size for comparison
+    float tx2, ty2, tz2, r2, p2, y2;
+    if (compute_qr_pose_sized(corners, K, QR_SIZE_SMALL_MM, tx2, ty2, tz2, r2, p2, y2)) {
+        float err_small2 = reproj_error(corners, K, QR_SIZE_SMALL_MM, tx2, ty2, tz2, r2, p2, y2);
+        if (err_small2 < err_nominal && err_small2 < err_small) {
+            det.tx = tx2; det.ty = ty2; det.tz = tz2;
+            det.roll = r2; det.pitch = p2; det.yaw = y2;
+            det.pose_valid = true;
+            return true;
+        }
+    }
+
+    det.tx = tx; det.ty = ty; det.tz = tz;
+    det.roll = roll; det.pitch = pitch; det.yaw = yaw;
     det.pose_valid = true;
     return true;
 }
@@ -1029,8 +1094,8 @@ static void process_qr_frame() {
     else s_decode_fail_streak = 0;
     bool run_retry_passes = (count == 0);
     if (!run_retry_passes && decoded_ok == 0) {
-        // Retry less often to control frame time; keep periodic recovery active.
-        run_retry_passes = ((s_decode_fail_streak % 4) == 0);
+        // Run pass 2 every 2nd failed frame to balance speed vs recovery.
+        run_retry_passes = ((s_decode_fail_streak % 2) == 0);
     }
 
     // Pass 2: contrast-stretched grayscale can recover some failed adaptive cases.
@@ -1048,8 +1113,7 @@ static void process_qr_frame() {
         }
 
         // Pass 3: inverted grayscale can recover polarity-sensitive decode failures.
-        // Run it sparsely because it is expensive and often low-yield.
-        if (decoded_ok == 0 && (s_decode_fail_streak % 8) == 0) {
+        if (decoded_ok == 0 && (s_decode_fail_streak % 4) == 0) {
             // Pass 2b: raw downsample without contrast stretch can preserve module
             // transitions that get distorted by global stretch.
             int raw_valid = 0;
@@ -1081,9 +1145,9 @@ static void process_qr_frame() {
         }
 
         // Pass 4+: decode recovery sweep with fixed adaptive biases.
-        // This runs only when payload decode is still failing.
-        if (decoded_ok == 0 && QR_USE_ADAPTIVE_BINARIZE) {
-            const int kBiases[] = {4};
+        // Throttled to every 3rd failed frame to keep frame time under ~2s.
+        if (decoded_ok == 0 && QR_USE_ADAPTIVE_BINARIZE && (s_decode_fail_streak % 3) == 0) {
+            const int kBiases[] = {3, 5};
             for (int bi = 0; bi < (int)(sizeof(kBiases) / sizeof(kBiases[0])); bi++) {
                 memcpy(g_proc_buf, g_proc_gray_buf, g_proc_w * g_proc_h);
                 adaptive_binarize_with_bias(g_proc_buf, g_proc_w, g_proc_h, kBiases[bi]);
