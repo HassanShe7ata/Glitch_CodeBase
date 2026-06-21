@@ -240,7 +240,7 @@ const float TICKS_ROTATE = 8730.00f;
 // --- COMPETITION DISTANCES (meters) - update after calibration ---
 const float DIST_1 = 0.615; // FWD to red box
 const float DIST_2 = 1.33;  // FWD to platform
-const float DIST_3 = 0.35;  // BWD centering //was 0.5
+const float DIST_3 = 0.30;  // BWD centering //was 0.5
 const float DIST_4 = 1.65;  // RIGHT to green box
 const float DIST_5 = 0.1;   // LEFT centering
 const float DIST_6 = 1.45;  // FWD after 180 turn
@@ -261,6 +261,12 @@ const int8_t V_FORWARD[] = {1, -1, -1, 1};
 const int8_t V_BACKWARD[] = {-1, 1, 1, -1};
 const int8_t V_STRAFE_R[] = {1, 1, 1, 1};
 const int8_t V_STRAFE_L[] = {-1, -1, -1, -1};
+
+// --- MECHANICAL COMPENSATION ---
+// Right strafe drifts forward slightly; subtract from front, add to back
+const int8_t STRAFE_R_BACK_COMP = 20; // % of motor speed
+// Left strafe drifts backward slightly; add forward, subtract back
+const int8_t STRAFE_L_FWD_COMP = 20; // % of motor speed
 
 const int8_t V_ROTATE_CW[] = {1, -1, 1, -1};
 const int8_t V_ROTATE_CCW[] = {-1, 1, -1, 1};
@@ -463,6 +469,26 @@ void updateMotors() {
   int8_t fr = moveSpeed * moveVec[1];
   int8_t bl = moveSpeed * moveVec[2];
   int8_t br = moveSpeed * moveVec[3];
+
+  // Strafe right mechanical compensation: subtract from front, add to back
+  if (moveVec[0] == 1 && moveVec[1] == 1 && moveVec[2] == 1 &&
+      moveVec[3] == 1) {
+    int8_t comp = (int8_t)((int)moveSpeed * STRAFE_R_BACK_COMP / 100);
+    fl -= comp;
+    fr -= comp;
+    bl += comp;
+    br += comp;
+  }
+
+  // Strafe left mechanical compensation: add forward, subtract back
+  if (moveVec[0] == -1 && moveVec[1] == -1 && moveVec[2] == -1 &&
+      moveVec[3] == -1) {
+    int8_t comp = (int8_t)((int)moveSpeed * STRAFE_L_FWD_COMP / 100);
+    fl += comp;
+    fr -= comp;
+    bl -= comp;
+    br += comp;
+  }
 
   if (!moveIsRotation) {
     float yawError = moveTargetHeading - currentYaw;
@@ -945,6 +971,11 @@ void handleCommand(const String &msg) {
         moveActive = true;
       }
     }
+  } else if (cmd == "ROT143") {
+    if (!autonomousMode && !pendingStep) {
+      pendingStep = true;
+      stepArg = "ROT143";
+    }
   } else if (cmd == "POSE") {
     if (!autonomousMode && !pendingStep) {
       pendingStep = true;
@@ -1250,6 +1281,9 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
             <button id="btnRotCCW" data-cmd="MOVE" data-arg="ROTCCW">Rotate &#8634;</button>
             <button id="btnRotCW"  data-cmd="MOVE" data-arg="ROTCW">Rotate &#8635;</button>
         </div>
+        <div style="margin-top:8px;">
+            <button id="btnRot143"  data-cmd="ROT143" class="btn-auto">143&deg; &#8635;</button>
+        </div>
         <div class="section-label" style="margin-top:14px">Motor Speed</div>
         <div class="slider-row">
             <input type="range" id="speed" min="0" max="100" value="25">
@@ -1268,18 +1302,6 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
         <div class="grid-3" style="margin-bottom:10px;">
             <button data-cmd="ARM" data-arg="HOME" class="danger">Home</button>
             <button data-cmd="ARM" data-arg="CTP">Car &rarr; Plt</button>
-        </div>
-        <div class="section-label">To Platform</div>
-        <div class="grid-3">
-            <button data-cmd="ARM" data-arg="RTP" class="btn-r">R &rarr; Plt</button>
-            <button data-cmd="ARM" data-arg="GTP" class="btn-g">G &rarr; Plt</button>
-            <button data-cmd="ARM" data-arg="BTP" class="btn-b">B &rarr; Plt</button>
-        </div>
-        <div class="section-label" style="margin-top:8px">To Car</div>
-        <div class="grid-3">
-            <button data-cmd="ARM" data-arg="RTC" class="btn-r">R &rarr; Car</button>
-            <button data-cmd="ARM" data-arg="GTC" class="btn-g">G &rarr; Car</button>
-            <button data-cmd="ARM" data-arg="BTC" class="btn-b">B &rarr; Car</button>
         </div>
     </div>
 
@@ -1423,6 +1445,16 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
             b.addEventListener('touchstart',sendDriveCmd,{passive:false});
             b.addEventListener('mousedown',sendDriveCmd);
         });
+
+        var rot143Btn=document.getElementById('btnRot143');
+        if(rot143Btn){
+            var sendRot143=function(e){
+                e.preventDefault();
+                send({cmd:'ROT143',arg:''});
+            };
+            rot143Btn.addEventListener('touchstart',sendRot143,{passive:false});
+            rot143Btn.addEventListener('mousedown',sendRot143);
+        }
 
         document.querySelectorAll('button[data-cmd]').forEach(function(b){
             if(b.closest('.pad')||b.id==='btnScanQR')return;
@@ -2034,6 +2066,8 @@ void loop() {
         if (fabs(err) < 1.0f)
           break;
       }
+    } else if (stepArg == "ROT143") {
+      rotateDegrees(true, 143, Motor_speed);
     }
     pendingStep = false;
   }
@@ -2153,7 +2187,19 @@ void loop() {
 
     // Step 8: RIGHT to green box
     Serial.println("[AUTO] Step 8: Right to green box");
-    moveDistanceKp(V_STRAFE_R, Motor_speed, DIST_4, TICKS_STRAFE);
+    moveDistanceKp(V_STRAFE_R, Motor_speed, DIST_4 / 2, TICKS_STRAFE);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    rotateToHeading(0, Motor_speed);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    rotateToHeading(0, Motor_speed);
+    if (!autonomousMode)
+      goto autoEnd;
+
+    moveDistanceKp(V_STRAFE_R, Motor_speed, DIST_4 / 2, TICKS_STRAFE);
     if (!autonomousMode)
       goto autoEnd;
 

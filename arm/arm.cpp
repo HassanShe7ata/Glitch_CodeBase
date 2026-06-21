@@ -607,12 +607,11 @@ void RedToFloor() {
 void GreenToCar() {
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
-  delay(100);
-  moveRobot(posRod[0], posRod[1] - 80, posRod[2] + 40, posRod[3], 1);
+  moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
   moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2] + 40, posGreen[3], 1);
-  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2] + 5, posGreen[3], 1);
-  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2], posGreen[3], 0);
-  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2] + 40, posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1] + 30, posGreen[2], posGreen[3], 1);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2], posGreen[3], 0);
+  moveRobot(posGreen[0], posGreen[1], posGreen[2] + 40, posGreen[3], 0);
   delay(200);
   goHome();
 }
@@ -620,7 +619,6 @@ void GreenToCar() {
 void BlueToCar() {
   moveRobot(posRod[0], posRod[1], posRod[2], posRod[3], 1);
   moveRobot(posRod[0], posRod[1], posRod[2] + 40, posRod[3], 1);
-  delay(100);
   moveRobot(posRod[0], posRod[1] - 60, posRod[2] + 40, posRod[3], 1);
   moveRobot(posBlue[0], posBlue[1], posBlue[2] + 40, posBlue[3], 1);
   moveRobot(posBlue[0] - 45, posBlue[1], posBlue[2], posBlue[3], 1);
