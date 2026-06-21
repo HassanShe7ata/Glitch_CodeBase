@@ -276,10 +276,10 @@ static QRTrackState g_track = {0};
 // Tracker tuning knobs:
 // - HOLD/TAU/MIN_CONF define how long estimates remain usable after observation loss.
 // - OBS_ACCEPT_PROB controls how strict we are before accepting new observations.
-#define TRACK_MAX_HOLD_MS 5000U
-#define TRACK_DECAY_TAU_MS 3500.0f
-#define TRACK_MIN_CONF 0.08f
-#define OBS_ACCEPT_PROB 0.10f
+#define TRACK_MAX_HOLD_MS 3500U
+#define TRACK_DECAY_TAU_MS 2600.0f
+#define TRACK_MIN_CONF 0.10f
+#define OBS_ACCEPT_PROB 0.15f
 
 // Robustness-first but decode-enabled: user prefers payload visibility over speed.
 #define ENABLE_PAYLOAD_DECODE 1
@@ -475,11 +475,18 @@ static void quad_center(const float corners[4][2], float &cx, float &cy) {
 static bool decode_quirc_payload(struct quirc_code &code, QRDetection &det) {
     struct quirc_data data;
     quirc_decode_error_t derr = QUIRC_ERROR_DATA_ECC;
+    quirc_decode_error_t derr_flip = QUIRC_SUCCESS;
     if (ENABLE_PAYLOAD_DECODE) {
         derr = quirc_decode(&code, &data);
+        if (derr != QUIRC_SUCCESS) {
+            struct quirc_code flipped = code;
+            quirc_flip(&flipped);
+            derr_flip = quirc_decode(&flipped, &data);
+            derr = derr_flip;
+        }
     }
     g_last_decode_err = (int)derr;
-    g_last_decode_err_flip = 0;
+    g_last_decode_err_flip = (int)derr_flip;
 
     if (derr == QUIRC_SUCCESS) {
         int len = data.payload_len;
@@ -997,24 +1004,15 @@ static void process_qr_frame() {
 
     if (!g_proc_gray_buf) return;
 
-    // --- Build the raw grayscale source buffer ---
-    // When DOWNSCALE=1, g_gray_buf IS the processing-resolution image —
-    // skip the downsample memcpy entirely.
-    uint8_t *raw = g_gray_buf;
-    if (QR_DOWNSCALE > 1) {
-        downsample_gray(g_gray_buf, w, h, g_proc_raw_buf);
-        raw = g_proc_raw_buf;
-    }
+    downsample_gray(g_gray_buf, w, h, g_proc_raw_buf);
+    memcpy(g_proc_gray_buf, g_proc_raw_buf, g_proc_w * g_proc_h);
+    contrast_stretch(g_proc_gray_buf, g_proc_w * g_proc_h);
 
-    // --- Pass 1: raw grayscale ---
-    // run_quirc_scan copies src into quirc's internal buffer (read-only on src),
-    // so pass raw directly — no intermediate copy to g_proc_buf needed.
-    // If adaptive binarize is enabled for the main pass, we do need a mutable copy.
-    uint8_t *pass1_src = raw;
+    // Quirc-native main pass: raw grayscale first. Heavier preprocessing is
+    // retained in fallback passes to recover difficult frames.
+    memcpy(g_proc_buf, g_proc_raw_buf, g_proc_w * g_proc_h);
     if (QR_USE_ADAPTIVE_BINARIZE && QR_MAIN_USE_ADAPTIVE) {
-        memcpy(g_proc_buf, raw, g_proc_w * g_proc_h);
         adaptive_binarize(g_proc_buf, g_proc_w, g_proc_h);
-        pass1_src = g_proc_buf;
     }
 
     QRDetection *dets = g_scan_dets;
@@ -1022,28 +1020,21 @@ static void process_qr_frame() {
     uint32_t now_ms = millis();
     int count = 0;
     int decoded_ok = 0;
-    run_quirc_scan(pass1_src, dets, valid, count, decoded_ok);
+    run_quirc_scan(g_proc_buf, dets, valid, count, decoded_ok);
 
-    // Early exit: if pass 1 decoded successfully, skip all retry passes
+    // Pass 2+: retry passes are expensive; throttle only lightly so decode
+    // recovery still runs often enough to matter during live alignment.
     static uint32_t s_decode_fail_streak = 0;
-    if (decoded_ok > 0) {
-        s_decode_fail_streak = 0;
-    } else {
-        s_decode_fail_streak++;
-    }
-
-    // Pass 2+: only run contrast-stretched pass (cap at 2 passes total)
+    if (decoded_ok == 0) s_decode_fail_streak++;
+    else s_decode_fail_streak = 0;
     bool run_retry_passes = (count == 0);
     if (!run_retry_passes && decoded_ok == 0) {
+        // Retry less often to control frame time; keep periodic recovery active.
         run_retry_passes = ((s_decode_fail_streak % 4) == 0);
     }
 
-    // Pass 2: contrast-stretched grayscale (final retry — passes 3/4 removed for speed)
-    // Deferred: only prepare g_proc_gray_buf when pass 2 is actually needed.
+    // Pass 2: contrast-stretched grayscale can recover some failed adaptive cases.
     if (run_retry_passes) {
-        memcpy(g_proc_gray_buf, raw, g_proc_w * g_proc_h);
-        contrast_stretch(g_proc_gray_buf, g_proc_w * g_proc_h);
-
         int alt_valid = 0;
         int alt_count = 0;
         int alt_decoded_ok = 0;
@@ -1054,6 +1045,62 @@ static void process_qr_frame() {
             valid = alt_valid;
             count = alt_count;
             decoded_ok = alt_decoded_ok;
+        }
+
+        // Pass 3: inverted grayscale can recover polarity-sensitive decode failures.
+        // Run it sparsely because it is expensive and often low-yield.
+        if (decoded_ok == 0 && (s_decode_fail_streak % 8) == 0) {
+            // Pass 2b: raw downsample without contrast stretch can preserve module
+            // transitions that get distorted by global stretch.
+            int raw_valid = 0;
+            int raw_count = 0;
+            int raw_decoded_ok = 0;
+            run_quirc_scan(g_proc_raw_buf, g_alt_scan_dets, raw_valid, raw_count, raw_decoded_ok);
+            if (raw_decoded_ok > decoded_ok || (decoded_ok == 0 && raw_count > count)) {
+                memcpy(dets, g_alt_scan_dets, sizeof(g_alt_scan_dets));
+                valid = raw_valid;
+                count = raw_count;
+                decoded_ok = raw_decoded_ok;
+            }
+
+            int n = g_proc_w * g_proc_h;
+            for (int i = 0; i < n; i++) {
+                g_proc_buf[i] = 255 - g_proc_gray_buf[i];
+            }
+            int inv_valid = 0;
+            int inv_count = 0;
+            int inv_decoded_ok = 0;
+            run_quirc_scan(g_proc_buf, g_inv_scan_dets, inv_valid, inv_count, inv_decoded_ok);
+
+            if (inv_decoded_ok > decoded_ok || (decoded_ok == 0 && inv_count > count)) {
+                memcpy(dets, g_inv_scan_dets, sizeof(g_inv_scan_dets));
+                valid = inv_valid;
+                count = inv_count;
+                decoded_ok = inv_decoded_ok;
+            }
+        }
+
+        // Pass 4+: decode recovery sweep with fixed adaptive biases.
+        // This runs only when payload decode is still failing.
+        if (decoded_ok == 0 && QR_USE_ADAPTIVE_BINARIZE) {
+            const int kBiases[] = {4};
+            for (int bi = 0; bi < (int)(sizeof(kBiases) / sizeof(kBiases[0])); bi++) {
+                memcpy(g_proc_buf, g_proc_gray_buf, g_proc_w * g_proc_h);
+                adaptive_binarize_with_bias(g_proc_buf, g_proc_w, g_proc_h, kBiases[bi]);
+
+                int fb_valid = 0;
+                int fb_count = 0;
+                int fb_decoded_ok = 0;
+                run_quirc_scan(g_proc_buf, g_alt_scan_dets, fb_valid, fb_count, fb_decoded_ok);
+
+                if (fb_decoded_ok > decoded_ok || (decoded_ok == 0 && fb_count > count)) {
+                    memcpy(dets, g_alt_scan_dets, sizeof(g_alt_scan_dets));
+                    valid = fb_valid;
+                    count = fb_count;
+                    decoded_ok = fb_decoded_ok;
+                }
+                if (decoded_ok > 0) break;
+            }
         }
     }
 
