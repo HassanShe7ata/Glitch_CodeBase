@@ -1325,6 +1325,12 @@ const char CONTROLLER_HTML[] PROGMEM = R"rawliteral(
             <button data-cmd="ARM" data-arg="HOME" class="danger">Home</button>
             <button data-cmd="ARM" data-arg="CTP">Car &rarr; Plt</button>
         </div>
+        <div class="section-label" style="margin-top:8px">To Car</div>
+        <div class="grid-3">
+            <button data-cmd="ARM" data-arg="RTC" class="btn-r">R &rarr; Car</button>
+            <button data-cmd="ARM" data-arg="GTC" class="btn-g">G &rarr; Car</button>
+            <button data-cmd="ARM" data-arg="BTC" class="btn-b">B &rarr; Car</button>
+        </div>
     </div>
 
     <div class="card">
