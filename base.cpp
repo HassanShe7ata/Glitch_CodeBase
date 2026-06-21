@@ -986,12 +986,34 @@ void handleCommand(const String &msg) {
     Serial.printf("Motor Speed Updated: %d\n", Motor_speed);
   } else if (cmd == "ARM") {
     if (arg == "HOME") {
+      robotState = "Arm: Home";
       sendCommandToArm("H");
     } else if (arg == "SCAN_POSE") {
+      robotState = "Arm: Scan Pose";
       sendCommandToArm("S");
     } else if (arg == "CTP") {
+      robotState = "Arm: Car to Plt";
       sendCommandToArm("CTP");
+    } else if (arg == "RTF") {
+      robotState = "Dropping Red";
+      sendCommandToArm("RTF");
+    } else if (arg == "GTF") {
+      robotState = "Dropping Green";
+      sendCommandToArm("GTF");
+    } else if (arg == "BTF") {
+      robotState = "Dropping Blue";
+      sendCommandToArm("BTF");
+    } else if (arg == "RTC") {
+      robotState = "Catching Red";
+      sendCommandToArm("RTC");
+    } else if (arg == "GTC") {
+      robotState = "Catching Green";
+      sendCommandToArm("GTC");
+    } else if (arg == "BTC") {
+      robotState = "Catching Blue";
+      sendCommandToArm("BTC");
     } else {
+      robotState = "Arm: " + String(arg.c_str());
       sendCommandToArm(arg.c_str());
     }
   } else if (cmd == "SSTEP") {
@@ -1568,6 +1590,13 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-seri
 .state-rotating{background:rgba(251,146,60,0.2);color:#fb923c;border:1px solid rgba(251,146,60,0.4)}
 .state-scanning{background:rgba(168,85,247,0.2);color:#a855f7;border:1px solid rgba(168,85,247,0.4)}
 .state-arm{background:rgba(236,72,153,0.2);color:#ec4899;border:1px solid rgba(236,72,153,0.4)}
+.state-comp{background:rgba(251,191,36,0.2);color:#fbbf24;border:1px solid rgba(251,191,36,0.4)}
+.state-dropping{background:rgba(239,68,68,0.2);color:#f87171;border:1px solid rgba(239,68,68,0.4)}
+.state-dropping-red{background:rgba(239,68,68,0.2);color:#ef4444;border:1px solid rgba(239,68,68,0.4)}
+.state-dropping-green{background:rgba(34,197,94,0.2);color:#22c55e;border:1px solid rgba(34,197,94,0.4)}
+.state-dropping-blue{background:rgba(59,130,246,0.2);color:#3b82f6;border:1px solid rgba(59,130,246,0.4)}
+.state-calibrating{background:rgba(34,211,238,0.2);color:#22d3ee;border:1px solid rgba(34,211,238,0.4)}
+.state-catching{background:rgba(250,204,21,0.2);color:#facc15;border:1px solid rgba(250,204,21,0.4)}
 .qr-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
 .qr-tile{background:#1a1a2a;border-radius:6px;padding:8px}
 .qr-tile .lbl{font-size:9px;color:#666;text-transform:uppercase;letter-spacing:0.5px}
@@ -1691,7 +1720,14 @@ function pollStatus(){
     sb.textContent=st;
     sb.className='state-badge';
     if(st==='Idle')sb.classList.add('state-idle');
+    else if(st.indexOf('Dropping Red')>=0)sb.classList.add('state-dropping-red');
+    else if(st.indexOf('Dropping Green')>=0)sb.classList.add('state-dropping-green');
+    else if(st.indexOf('Dropping Blue')>=0)sb.classList.add('state-dropping-blue');
+    else if(st.indexOf('Dropping')>=0)sb.classList.add('state-dropping');
+    else if(st.indexOf('Catching')>=0)sb.classList.add('state-catching');
     else if(st.indexOf('Rotating')>=0)sb.classList.add('state-rotating');
+    else if(st.indexOf('Comp:')>=0)sb.classList.add('state-comp');
+    else if(st.indexOf('Cal:')>=0)sb.classList.add('state-calibrating');
     else if(st.indexOf('Scanning')>=0||st.indexOf('Aligning')>=0)sb.classList.add('state-scanning');
     else if(st.indexOf('Arm')>=0)sb.classList.add('state-arm');
     else sb.classList.add('state-moving');
@@ -2055,6 +2091,7 @@ void loop() {
   if (pendingStep && !moveActive) {
     if (stepArg.startsWith("POSE:")) {
       float heading = stepArg.substring(5).toFloat();
+      robotState = "Rotating to " + String(heading, 0) + "°";
       for (int attempt = 0; attempt < 3; attempt++) {
         rotateToHeading(heading, Motor_speed);
         updateYaw();
@@ -2067,6 +2104,7 @@ void loop() {
           break;
       }
     } else if (stepArg == "ROT143") {
+      robotState = "Rotating 143°";
       rotateDegrees(true, 143, Motor_speed);
     }
     pendingStep = false;
@@ -2093,6 +2131,7 @@ void loop() {
     Serial.println("[AUTO] === Starting calibration sequence ===");
 
     Serial.println("[AUTO] Step 1: Forward 1m (record encoder data)");
+    robotState = "Cal: FWD 1m";
     moveDistanceKp(V_FORWARD, Motor_speed, 1.0, TICKS_FWD_BWD);
     if (!autonomousMode)
       goto calEnd;
@@ -2100,6 +2139,7 @@ void loop() {
     delay(2500);
 
     Serial.println("[AUTO] Strafe right for 1 meter (calibration)");
+    robotState = "Cal: Strafe R 1m";
     moveDistanceKp(V_STRAFE_R, Motor_speed, 1.0, TICKS_STRAFE);
     if (!autonomousMode)
       goto calEnd;
@@ -2107,6 +2147,7 @@ void loop() {
     delay(2500);
 
     // rotate 180 degrees
+    robotState = "Cal: Rot 180°";
     rotateDegrees(false, 180.0, Motor_speed);
     if (!autonomousMode)
       goto calEnd;
@@ -2114,6 +2155,7 @@ void loop() {
     delay(2500);
 
     Serial.println("[AUTO] Diagonal FWD 1m (record encoder data)");
+    robotState = "Cal: Diag FR 1m";
     moveDistanceKp(V_DIAG_FR, Motor_speed, 1.0, TICKS_DIAG);
     if (!autonomousMode)
       goto calEnd;
@@ -2132,12 +2174,14 @@ void loop() {
 
     // Step 1: FWD to red box
     Serial.println("[AUTO] Step 1: Forward to red box");
+    robotState = "Comp: FWD to Red";
     moveDistanceKp(V_FORWARD, Motor_speed, DIST_1, TICKS_FWD_BWD);
     if (!autonomousMode)
       goto autoEnd;
 
     // Step 2: Rotate 90 CCW
     Serial.println("[AUTO] Step 2: Rotate 90 CCW");
+    robotState = "Comp: Rot 90°";
     rotateDegrees(false, 90, Motor_speed);
     if (!autonomousMode)
       goto autoEnd;
@@ -2156,12 +2200,14 @@ void loop() {
 
     // Step 4 FWD to red box area
     Serial.println("[AUTO] Step 5: Forward to red box area");
+    robotState = "Comp: FWD to Red";
     moveDistanceKp(V_FORWARD, Motor_speed, DIST_2, TICKS_FWD_BWD);
     if (!autonomousMode)
       goto autoEnd;
 
     // Step 5: Red to Floor
     Serial.println("[AUTO] Step 5: Red -> Floor");
+    robotState = "Dropping Red";
     sendCommandToArm("RTF");
     waitForArmIdle(15000);
     if (!autonomousMode)
@@ -2169,24 +2215,28 @@ void loop() {
 
     // Step 6: BWD centering
     Serial.println("[AUTO] Step 6: Backward centering");
+    robotState = "Comp: BWD Center";
     moveDistanceKp(V_BACKWARD, Motor_speed, DIST_3, TICKS_FWD_BWD);
     if (!autonomousMode)
       goto autoEnd;
 
     // Step 7: Pose correction to 0
     Serial.println("[AUTO] Step 7: Pose correction to 0");
+    robotState = "Comp: Align 0°";
     rotateToHeading(0, Motor_speed);
     if (!autonomousMode)
       goto autoEnd;
 
     // Step 7.5: Pose correction to 0 again
     Serial.println("[AUTO] Step 7.5: Rotate 0 degrees");
+    robotState = "Comp: Align 0°";
     rotateToHeading(0, Motor_speed);
     if (!autonomousMode)
       goto autoEnd;
 
     // Step 8: RIGHT to green box
     Serial.println("[AUTO] Step 8: Right to green box");
+    robotState = "Comp: Strafe to Green";
     moveDistanceKp(V_STRAFE_R, Motor_speed, DIST_4 / 2, TICKS_STRAFE);
     if (!autonomousMode)
       goto autoEnd;
@@ -2205,6 +2255,7 @@ void loop() {
 
     // Step 9: Green to Floor
     Serial.println("[AUTO] Step 9: Green -> Floor");
+    robotState = "Dropping Green";
     sendCommandToArm("GTF");
     waitForArmIdle(15000);
     if (!autonomousMode)
@@ -2212,12 +2263,14 @@ void loop() {
 
     // Step 10: LEFT centering
     Serial.println("[AUTO] Step 10: Left centering");
+    robotState = "Comp: Left Center";
     moveDistanceKp(V_STRAFE_L, Motor_speed, DIST_5, TICKS_STRAFE);
     if (!autonomousMode)
       goto autoEnd;
 
     // Step 11: Rotate 180
     Serial.println("[AUTO] Step 11: Rotate 180");
+    robotState = "Comp: Rot 180°";
     rotateDegrees(true, 180, Motor_speed);
     if (!autonomousMode)
       goto autoEnd;
@@ -2230,24 +2283,28 @@ void loop() {
     */
     // Step 12.5: Pose correction to 180 again
     Serial.println("[AUTO] Step 12.5: Rotate 180 degrees");
+    robotState = "Comp: Align 180°";
     rotateToHeading(180, Motor_speed);
     if (!autonomousMode)
       goto autoEnd;
 
     // Step 13: FWD
     Serial.println("[AUTO] Step 13: Forward");
+    robotState = "Comp: FWD to Blue";
     moveDistanceKp(V_FORWARD, Motor_speed, DIST_6, TICKS_FWD_BWD);
     if (!autonomousMode)
       goto autoEnd;
 
     // Step 14: DIAG to blue box
     Serial.println("[AUTO] Step 14: Diagonal to blue box");
+    robotState = "Comp: Diag to Blue";
     moveDistanceKp(V_DIAG_FR, Motor_speed, DIST_7, TICKS_DIAG);
     if (!autonomousMode)
       goto autoEnd;
 
     // Step 15: Blue to Floor
     Serial.println("[AUTO] Step 15: Blue -> Floor");
+    robotState = "Dropping Blue";
     sendCommandToArm("BTF");
     waitForArmIdle(20000);
 
