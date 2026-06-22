@@ -76,7 +76,6 @@ The web dashboard provides:
 - Camera MJPEG live stream
 - QR code detection status and pose data
 - Platform detection overlay
-- Blynk integration for mobile control
 - Autonomous mode toggle and telemetry
 
 ---
