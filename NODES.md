@@ -45,9 +45,9 @@ expects inside a `uint8_t[6]`).
 
 Each board also self-identifies in its own firmware at boot:
 
-- `base.ino` — prints Base AP IP and UDP node addresses.
-- `arm/arm.ino` — prints `ARM MAC`, `ARM IP`, and WiFi channel.
-- `firmware/cam_stream/src/main.cpp` — prints `CAMERA MAC`, `CAMERA IP`, and WiFi channel.
+- `base.cpp` — prints Base AP IP and UDP node addresses.
+- `arm/arm.cpp` — prints `ARM MAC`, `ARM IP`, and WiFi channel.
+- `camera/src/main.cpp` — prints `CAMERA MAC`, `CAMERA IP`, and WiFi channel.
 
 So a re-verify is one flash + monitor away on every node.
 

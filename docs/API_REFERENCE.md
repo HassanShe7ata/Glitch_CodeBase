@@ -2,8 +2,8 @@
 
 ## Academic/Industrial Documentation
 
-**Version:** 1.0  
-**Date:** 2024  
+**Version:** 2.0  
+**Date:** 2026  
 **Project:** Glitch - Omnidirectional Mecanum Wheel Robot with Computer Vision
 
 ---
@@ -604,7 +604,7 @@ void OnDataRecv(const esp_now_recv_info_t *info,
 }
 ```
 
-> **FIX APPLIED (2026-06-17):** All three active firmware files now use this correct signature. Previously `base.ino`, `arm.cpp`, and `camera/src/main.cpp` all used the old `const uint8_t*` signature which silently fails at runtime on ESP-IDF 5.x.
+> **FIX APPLIED (2026-06-17):** All three active firmware files now use this correct signature. Previously `base.cpp`, `arm/arm.cpp`, and `camera/src/main.cpp` all used the old `const uint8_t*` signature which silently fails at runtime on ESP-IDF 5.x.
 
 #### Incorrect Signature (Old, causes silent failure)
 

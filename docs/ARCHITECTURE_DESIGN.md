@@ -2,8 +2,8 @@
 
 ## Academic/Industrial Documentation
 
-**Version:** 1.0  
-**Date:** 2024  
+**Version:** 2.0  
+**Date:** 2026  
 **Project:** Glitch - Omnidirectional Mecanum Wheel Robot with Computer Vision
 
 ---

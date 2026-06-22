@@ -10,15 +10,15 @@
 ### Bug Fixed
 | Fix | File | What was wrong |
 |-----|------|----------------|
-| Platform API JSON keys | [main.cpp:1350](file:///d:/Glitch_Codes/Glitch_CodeBase/firmware/cam_stream/src/main.cpp#L1349-L1350) | API sent `width`/`height`/`angle` but dashboard read `width_px`/`height_px`/`angle_deg`. Platform panel showed `undefined`. **Fixed API to send matching keys.** |
+| Platform API JSON keys | [main.cpp:1350](camera/src/main.cpp#L1349-L1350) | API sent `width`/`height`/`angle` but dashboard read `width_px`/`height_px`/`angle_deg`. Platform panel showed `undefined`. **Fixed API to send matching keys.** |
 
 ### Code Improvements Applied
 
 | ID | Change | Files Modified | Why it matters |
 |----|--------|---------------|----------------|
-| CI-2 | Arm ISR → loop() flag pattern | [ArmwithBlynk.ino](file:///d:/Glitch_Codes/Glitch_CodeBase/ArmwithBlynk.ino#L410-L460) | ISR was running full servo sequences (5+ seconds). Now ISR just copies command + sends ACK, loop() does the heavy work. **Prevents missed ESP-NOW packets.** |
-| CI-3 | ESP-NOW ACK protocol | [ArmwithBlynk.ino](file:///d:/Glitch_Codes/Glitch_CodeBase/ArmwithBlynk.ino#L439-L450) + [basewithBlynk.ino](file:///d:/Glitch_Codes/Glitch_CodeBase/basewithBlynk.ino#L143-L170) | Base now waits 500ms for ACK after sending arm command. Retries once if no ACK. **You'll see `[ARM] No ACK` in Serial if arm doesn't receive commands.** |
-| CI-4 | Platform angle estimation | [platform_detect.cpp](file:///d:/Glitch_Codes/Glitch_CodeBase/firmware/cam_stream/src/platform_detect.cpp#L344-L366) | Was hardcoded `0.0f`. Now computes actual rotation from Sobel gradients using double-angle averaging. **Dashboard angle display now shows real values.** |
+| CI-2 | Arm ISR → loop() flag pattern | [ArmwithBlynk.ino](old/oldBlynkcodes/ArmwithBlynk.ino#L410-L460) | ISR was running full servo sequences (5+ seconds). Now ISR just copies command + sends ACK, loop() does the heavy work. **Prevents missed ESP-NOW packets.** |
+| CI-3 | ESP-NOW ACK protocol | [ArmwithBlynk.ino](old/oldBlynkcodes/ArmwithBlynk.ino#L439-L450) + [basewithBlynk.ino](old/oldBlynkcodes/basewithBlynk.ino#L143-L170) | Base now waits 500ms for ACK after sending arm command. Retries once if no ACK. **You'll see `[ARM] No ACK` in Serial if arm doesn't receive commands.** |
+| CI-4 | Platform angle estimation | [platform_detect.cpp](camera/src/platform_detect.cpp#L344-L366) | Was hardcoded `0.0f`. Now computes actual rotation from Sobel gradients using double-angle averaging. **Dashboard angle display now shows real values.** |
 
 ### Files Archived
 Moved to `old md files/`:

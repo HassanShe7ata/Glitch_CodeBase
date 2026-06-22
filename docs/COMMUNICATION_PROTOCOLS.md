@@ -2,8 +2,8 @@
 
 ## Academic/Industrial Documentation
 
-**Version:** 1.0  
-**Date:** 2024  
+**Version:** 2.0  
+**Date:** 2026  
 **Project:** Glitch - Omnidirectional Mecanum Wheel Robot with Computer Vision
 
 ---
@@ -220,7 +220,7 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 }
 ```
 
-> **FIX APPLIED (2026-06-17):** All three active firmware files (`base.ino`, `arm.cpp`, `camera/src/main.cpp`) have been updated from the old `const uint8_t*` signature to the correct `const esp_now_recv_info_t*` signature. Send callbacks also updated to `const esp_now_send_info_t*` where applicable.
+> **FIX APPLIED (2026-06-17):** All three active firmware files (`base.cpp`, `arm/arm.cpp`, `camera/src/main.cpp`) have been updated from the old `const uint8_t*` signature to the correct `const esp_now_recv_info_t*` signature. Send callbacks also updated to `const esp_now_send_info_t*` where applicable.
 
 ---
 
@@ -413,7 +413,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
 | `/status` | GET | Robot status (arm busy, QR results, telemetry) | JSON |
 | `/cmd` | POST | Receive commands from dashboard (move, arm, scan) | JSON `{"ok":true}` |
 
-> **INCONSISTENCY**: Old docs listed `/healthz` — this endpoint does not exist in current `base.ino`. Replaced by `/status` and `/cmd`.
+> **INCONSISTENCY**: Old docs listed `/healthz` — this endpoint does not exist in current `base.cpp`. Replaced by `/status` and `/cmd`.
 
 ---
 
@@ -730,7 +730,7 @@ if (!readEncoders(data)) {
 
 ### A. Complete Packet Definitions
 
-See `base.ino`, `arm.ino`, `camera/src/main.cpp` for complete struct definitions.
+See `base.cpp`, `arm/arm.cpp`, `camera/src/main.cpp` for complete struct definitions.
 
 ### B. Serial Debug Messages
 
